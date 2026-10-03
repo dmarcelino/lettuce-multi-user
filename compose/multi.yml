@@ -1,0 +1,10 @@
+# Merged by lettucectl on top of upstream/docker/compose.yml for every stack.
+#
+# Every upstream stack publishes the same host ports: BFF_PORT (8090) and the
+# agent web-app range 3000-3099. Two stacks on one host would collide, and
+# behind a Cloudflare Tunnel neither is needed: cloudflared reaches
+# app-server:8080 over the stack's own Docker network. So nothing is published.
+# `!reset` needs Docker Compose >= 2.24.
+services:
+  app-server:
+    ports: !reset []

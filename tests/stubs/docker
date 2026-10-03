@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Test stub for docker: records the call and answers the few queries lettucectl makes.
+# Settings come from $STUB_ROOT/stub.env, not the environment: lettucectl runs
+# docker under `env -i`. Tests copy the stubs to $STUB_ROOT/bin.
+STUB_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=/dev/null
+[[ -f $STUB_ROOT/stub.env ]] && . "$STUB_ROOT/stub.env"
+STUB_LOG=$STUB_ROOT/calls.log
+printf 'docker %s\n' "$*" >>"$STUB_LOG"
+printf 'docker-env PUBLIC_ORIGIN=%s\n' "${PUBLIC_ORIGIN:-}" >>"$STUB_LOG"
+args=" $* "
+case $args in
+  *" compose version "*) echo "${STUB_COMPOSE_VERSION:-2.40.3}" ;;
+  *" config --format json "*) cat "$STUB_ROOT/compose-config.json" 2>/dev/null ;;
+  *" config "*) exit "${STUB_COMPOSE_CONFIG_RC:-0}" ;;
+esac
+exit 0

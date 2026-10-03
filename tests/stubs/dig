@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Test stub for `dig +short TYPE NAME`: answers from $STUB_ROOT/dns.txt (lines of "name TYPE answer");
+# STUB_DNS_WILDCARD (in stub.env), when set, answers every A query (a wildcard record).
+# Settings come from $STUB_ROOT/stub.env, not the environment: lettucectl runs
+# docker under `env -i`. Tests copy the stubs to $STUB_ROOT/bin.
+STUB_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=/dev/null
+[[ -f $STUB_ROOT/stub.env ]] && . "$STUB_ROOT/stub.env"
+STUB_LOG=$STUB_ROOT/calls.log
+type="" name=""
+for a in "$@"; do
+  case $a in
+    +* | @*) ;;
+    *) if [[ -z $type ]]; then type=$a; else name=$a; fi ;;
+  esac
+done
+printf 'dig %s %s\n' "$type" "$name" >>"$STUB_LOG"
+if [[ -f $STUB_ROOT/dns.txt ]]; then
+  awk -v n="$name" -v t="$type" '$1 == n && $2 == t { $1 = ""; $2 = ""; sub(/^  /, ""); print }' "$STUB_ROOT/dns.txt"
+fi
+if [[ -n ${STUB_DNS_WILDCARD:-} && $type == A ]]; then echo "$STUB_DNS_WILDCARD"; fi
+exit 0

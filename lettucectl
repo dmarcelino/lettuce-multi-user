@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# lettucectl: run several Lettuce stacks on one host, one per person, each behind
+# its own Cloudflare Tunnel and Cloudflare Access application (Google login).
+# See README.md and docs/.
+set -euo pipefail
+
+LETTUCE_HOME=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lib/common.sh
+. "$LETTUCE_HOME/lib/common.sh"
+# shellcheck source=lib/cloudflare.sh
+. "$LETTUCE_HOME/lib/cloudflare.sh"
+
+MIN_COMPOSE=2.24.0
+
+usage() {
+  cat <<'EOF'
+Usage: lettucectl <command> [args]
+
+Setup
+  init                          check dependencies, clone upstream Lettuce, look up Cloudflare ids
+  add <name> <email>[,<email>]  create a stack: hostname, Access policy + app, tunnel, DNS; start it
+  users <name> <email>[,...]    replace who may sign in (Access policy and ALLOWED_USERS together)
+  remove <name> [--purge]       stop a stack and delete its Cloudflare resources (--purge: its data too)
+  upgrade <tag>                 move upstream Lettuce to another tag and rebuild every stack
+
+Operation (<target> is a stack name or "all")
+  up <target>                   check, then build and start
+  down <target>                 stop
+  restart <target>              down + up (app-server and bff share a namespace; never restart one alone)
+  check <target>                refuse unsafe or inconsistent configuration
+  status                        containers and health of every stack
+  list                          stacks, hostnames and allowed users
+  logs <name> [service]         follow logs
+  compose <name> <args...>      any other docker compose command for one stack
+EOF
+}
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+version_ge() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
+
+# pick_hostname NAME -> <name>.<domain>, or the fallback when that name exists in DNS
+pick_hostname() {
+  local name=$1 domain zone probe wildcard="" host rc fallback
+  domain=$(cfg DOMAIN)
+  zone=$(cfg CF_ZONE_ID)
+  probe="lettucectl-probe-$(openssl rand -hex 4).$domain"
+  if [[ -n $(dig +short A "$probe") ]]; then
+    wildcard=1
+    warn "$domain has a wildcard DNS record, so public DNS cannot tell which names are taken; checking the Cloudflare zone only"
+  fi
+  fallback=$(cfg HOSTNAME_FALLBACK)
+  [[ $fallback == *%s* ]] || die "HOSTNAME_FALLBACK must contain %s"
+  # shellcheck disable=SC2059 # the pattern is the format string by design
+  for host in "$name.$domain" "$(printf "$fallback" "$name").$domain"; do
+    if [[ -z $wildcard ]] && name_resolves "$host"; then
+      info "$host already exists in DNS"
+      continue
+    fi
+    rc=0
+    cf_dns_name_taken "$zone" "$host" || rc=$?
+    case $rc in
+      0) info "$host already exists in the Cloudflare zone" ;;
+      1)
+        printf '%s' "$host"
+        return 0
+        ;;
+      *) die "could not check $host in the Cloudflare zone" ;;
+    esac
+  done
+  die "both $name.$domain and $host are taken; choose another stack name"
+}
+
+name_resolves() {
+  local t
+  for t in A AAAA CNAME TXT MX; do
+    [[ -n $(dig +short "$t" "$1") ]] && return 0
+  done
+  return 1
+}
+
+write_new_stack_env() {
+  local name=$1 host=$2 emails=$3 f
+  f=$(stack_env "$name")
+  (umask 077 && mkdir -p "$(stack_dir "$name")/state")
+  chmod 700 "$(stack_dir "$name")"
+  (
+    umask 077
+    cat >"$f" <<EOF
+# Lettuce stack "$name", managed by lettucectl. Read by Docker Compose.
+# Secrets: keep this file mode 600 and out of version control.
+LETTUCE_HOSTNAME=$host
+PUBLIC_ORIGIN=https://$host
+ALLOWED_USERS=$emails
+COMPOSE_PROFILES=$(cfg PROFILES)
+LETTA_STATE_DIR=$(stack_dir "$name")/state
+TZ=$(cfg TZ)
+SESSION_SECRET=$(openssl rand -hex 32)
+CF_ACCESS_TEAM_DOMAIN=$(cfg CF_TEAM_DOMAIN)
+EOF
+  )
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_init() {
+  local c v f ref cur zone team idp
+  for c in docker git curl jq openssl dig; do
+    command -v "$c" >/dev/null || die "$c is required but not installed"
+  done
+  v=$(docker compose version --short 2>/dev/null) || die "the Docker Compose plugin is required"
+  version_ge "${v#v}" "$MIN_COMPOSE" || die "Docker Compose >= 2.24 is required (found $v)"
+
+  f=$(config_file)
+  if [[ ! -f $f ]]; then
+    (umask 077 && cp "$LETTUCE_HOME/config.env.example" "$f")
+    chmod 600 "$f"
+    die "created config.env; edit DOMAIN, PROFILES and TZ, then run: lettucectl init"
+  fi
+  require_config
+
+  f=$(token_file)
+  [[ -f $f ]] || die "no Cloudflare API token at .secrets/cloudflare-api-token (docs/cloudflare-setup.md, step 5)"
+  [[ $(file_mode "$f") == 600 ]] || die "the API token file must be mode 600 (chmod 600 $f)"
+
+  ref=$(cfg LETTUCE_REF)
+  if [[ ! -e $(upstream_dir) ]]; then
+    info "cloning $(cfg LETTUCE_REPO) at $ref"
+    git -c advice.detachedHead=false clone -q --branch "$ref" "$(cfg LETTUCE_REPO)" "$(upstream_dir)"
+  elif [[ -d $(upstream_dir)/.git ]]; then
+    cur=$(git -C "$(upstream_dir)" describe --tags --exact-match 2>/dev/null || echo "an untagged commit")
+    [[ $cur == "$ref" ]] || warn "upstream/ is at $cur but config.env says $ref; run: lettucectl upgrade $ref"
+  fi
+  [[ -f $(upstream_dir)/docker/compose.yml ]] || die "upstream/docker/compose.yml not found"
+
+  zone=$(cf_zone "$(cfg DOMAIN)") || die "could not look up the zone (is the API token valid?)"
+  [[ -n $zone ]] || die "zone $(cfg DOMAIN) not found: is the domain added to Cloudflare, and does the token have Zone Read on it?"
+  team=$(cf_team "${zone#* }") || die "could not read the Zero Trust organization (token needs Access: Organizations, Identity Providers, and Groups Read)"
+  [[ -n $team ]] || die "no Zero Trust organization yet (docs/cloudflare-setup.md, step 3)"
+  idp=$(cf_google_idp "${zone#* }") || die "could not list Access login methods"
+  [[ -n $idp ]] || die "no Google login method in Zero Trust (docs/cloudflare-setup.md, step 4)"
+
+  f=$(config_file)
+  env_set "$f" CF_ZONE_ID "${zone%% *}"
+  env_set "$f" CF_ACCOUNT_ID "${zone#* }"
+  env_set "$f" CF_TEAM_DOMAIN "$team"
+  env_set "$f" CF_GOOGLE_IDP_ID "$idp"
+  info "ready: zone $(cfg DOMAIN), Access team $team.cloudflareaccess.com, upstream $ref"
+  info "next: lettucectl add <name> <email>"
+}
+
+cmd_add() {
+  (($# == 2)) || die "usage: lettucectl add <name> <email>[,<email>]"
+  local name=$1 emails f host acc id pair
+  validate_name "$name"
+  emails=$(normalise_emails "$2")
+  require_initialised
+  f=$(stack_env "$name")
+  acc=$(cfg CF_ACCOUNT_ID)
+
+  if [[ -n $(env_get "$f" CF_DNS_RECORD_ID) ]]; then
+    die "stack '$name' already exists (use: lettucectl users|up|remove $name)"
+  elif [[ -f $f ]]; then
+    host=$(env_get "$f" LETTUCE_HOSTNAME)
+    info "resuming the unfinished setup of '$name' ($host)"
+    [[ -n $(env_get "$f" CF_ACCESS_POLICY_ID) ]] || env_set "$f" ALLOWED_USERS "$emails"
+  else
+    host=$(pick_hostname "$name")
+    write_new_stack_env "$name" "$host" "$emails"
+  fi
+  emails=$(env_get "$f" ALLOWED_USERS)
+  local hint="Cloudflare setup of '$name' stopped part-way; what exists is recorded in stacks/$name/stack.env. Fix the cause, then re-run: lettucectl add $name $emails"
+
+  if [[ -z $(env_get "$f" CF_ACCESS_POLICY_ID) ]]; then
+    id=$(cf_policy_create "$acc" "lettuce-$name" "$emails") || die "$hint"
+    env_set "$f" CF_ACCESS_POLICY_ID "$id"
+  fi
+  if [[ -z $(env_get "$f" CF_ACCESS_APP_ID) ]]; then
+    pair=$(cf_app_create "$acc" "lettuce-$name" "$host" "$(cfg CF_GOOGLE_IDP_ID)" \
+      "$(cfg ACCESS_SESSION_DURATION)" "$(env_get "$f" CF_ACCESS_POLICY_ID)") || die "$hint"
+    env_set "$f" CF_ACCESS_APP_ID "${pair%% *}"
+    env_set "$f" CF_ACCESS_AUD "${pair#* }"
+  fi
+  if [[ -z $(env_get "$f" CF_TUNNEL_ID) ]]; then
+    id=$(cf_tunnel_create "$acc" "lettuce-$name") || die "$hint"
+    env_set "$f" CF_TUNNEL_ID "$id"
+  fi
+  if [[ -z $(env_get "$f" CLOUDFLARE_TUNNEL_TOKEN) ]]; then
+    id=$(cf_tunnel_token "$acc" "$(env_get "$f" CF_TUNNEL_ID)") || die "$hint"
+    env_set "$f" CLOUDFLARE_TUNNEL_TOKEN "$id"
+  fi
+  cf_tunnel_configure "$acc" "$(env_get "$f" CF_TUNNEL_ID)" "$host" || die "$hint"
+  id=$(cf_dns_cname_create "$(cfg CF_ZONE_ID)" "$host" "$(env_get "$f" CF_TUNNEL_ID)" "lettucectl stack $name") || die "$hint"
+  env_set "$f" CF_DNS_RECORD_ID "$id"
+
+  cmd_up "$name"
+  info ""
+  info "'$name' is up: https://$host (sign in with Google as $emails)"
+  info "First boot builds images and can take a few minutes; the hostname may need a minute to resolve."
+}
+
+cmd_users() {
+  (($# == 2)) || die "usage: lettucectl users <name> <email>[,<email>]"
+  local name=$1 emails f pol
+  validate_name "$name"
+  emails=$(normalise_emails "$2")
+  require_initialised
+  require_stack "$name"
+  f=$(stack_env "$name")
+  pol=$(env_get "$f" CF_ACCESS_POLICY_ID)
+  [[ -n $pol ]] || die "'$name' has no Access policy yet; finish it with: lettucectl add $name $emails"
+  cf_policy_update "$(cfg CF_ACCOUNT_ID)" "$pol" "lettuce-$name" "$emails" || die "could not update the Access policy"
+  env_set "$f" ALLOWED_USERS "$emails"
+  cmd_up "$name"
+  info "'$name' now admits: $emails"
+}
+
+cmd_remove() {
+  local name=${1:-} purge="" answer f acc zone id
+  [[ ${2:-} == --purge ]] && purge=1
+  [[ -n $name && ($# == 1 || -n $purge) ]] || die "usage: lettucectl remove <name> [--purge]"
+  validate_name "$name"
+  require_initialised
+  require_stack "$name"
+  f=$(stack_env "$name")
+  acc=$(cfg CF_ACCOUNT_ID)
+  zone=$(cfg CF_ZONE_ID)
+
+  info "This stops '$name' and deletes its DNS record, tunnel and Access application."
+  if [[ -n $purge ]]; then
+    info "--purge also deletes ALL of its data (agents, memory, conversations): $(stack_dir "$name")"
+  else
+    info "Its data stays in $(stack_dir "$name")."
+  fi
+  printf 'Type the stack name to confirm: ' >&2
+  read -r answer || true
+  [[ $answer == "$name" ]] || die "aborted"
+
+  compose "$name" down -v || warn "docker compose down failed; continuing"
+  local left=()
+  id=$(env_get "$f" CF_DNS_RECORD_ID)
+  if [[ -n $id ]]; then
+    if cf_api DELETE "/zones/$zone/dns_records/$id" >/dev/null; then env_unset "$f" CF_DNS_RECORD_ID; else left+=("DNS record $id"); fi
+  fi
+  id=$(env_get "$f" CF_TUNNEL_ID)
+  if [[ -n $id ]]; then
+    cf_api DELETE "/accounts/$acc/cfd_tunnel/$id/connections" >/dev/null || true
+    if cf_api DELETE "/accounts/$acc/cfd_tunnel/$id" >/dev/null; then
+      env_unset "$f" CF_TUNNEL_ID
+      env_unset "$f" CLOUDFLARE_TUNNEL_TOKEN
+    else
+      left+=("tunnel $id")
+    fi
+  fi
+  id=$(env_get "$f" CF_ACCESS_APP_ID)
+  if [[ -n $id ]]; then
+    if cf_api DELETE "/accounts/$acc/access/apps/$id" >/dev/null; then
+      env_unset "$f" CF_ACCESS_APP_ID
+      env_unset "$f" CF_ACCESS_AUD
+    else
+      left+=("Access application $id")
+    fi
+  fi
+  id=$(env_get "$f" CF_ACCESS_POLICY_ID)
+  if [[ -n $id ]]; then
+    if cf_api DELETE "/accounts/$acc/access/policies/$id" >/dev/null; then env_unset "$f" CF_ACCESS_POLICY_ID; else left+=("Access policy $id"); fi
+  fi
+
+  if ((${#left[@]})); then
+    warn "not deleted (already gone, or delete it in the Cloudflare dashboard): ${left[*]}"
+    warn "their ids stay in stacks/$name/stack.env, so 'lettucectl remove $name' can retry"
+  fi
+  if [[ -n $purge ]]; then
+    if ((${#left[@]})); then
+      warn "keeping stacks/$name because Cloudflare resources are left; purge again after they are gone"
+      return 0
+    fi
+    # The state is root-owned (the app-server runs as root), so it is emptied
+    # from inside the stack's own image; the empty directories then go without sudo.
+    compose "$name" run --rm --no-deps -T --entrypoint find app-server \
+      /root/.letta /data /work -mindepth 1 -delete || die "could not empty the state of '$name'"
+    # `run` recreated the project network; remove it again before the env file goes.
+    compose "$name" down || warn "could not remove the network of '$name'"
+    rm -rf "$(stack_dir "$name")"
+    info "'$name' removed, data included"
+  else
+    info "'$name' removed from Cloudflare; data kept in $(stack_dir "$name")"
+  fi
+}
+
+cmd_upgrade() {
+  (($# == 1)) || die "usage: lettucectl upgrade <tag>"
+  local ref=$1 up n
+  require_config
+  up=$(upstream_dir)
+  [[ -d $up/.git ]] || die "upstream/ is not a git checkout"
+  git -C "$up" fetch -q --tags
+  git -C "$up" -c advice.detachedHead=false checkout -q "$ref"
+  env_set "$(config_file)" LETTUCE_REF "$ref"
+  info "upstream now at $ref; rebuilding every stack"
+  while read -r n; do
+    cmd_up "$n"
+  done < <(list_stacks)
+}
+
+cmd_up() {
+  (($# == 1)) || die "usage: lettucectl up <name|all>"
+  local n targets
+  require_initialised
+  targets=$(expand_targets "$1")
+  for n in $targets; do
+    check_stack "$n"
+    info "starting $n"
+    compose "$n" up -d --build --remove-orphans
+  done
+}
+
+cmd_down() {
+  (($# == 1)) || die "usage: lettucectl down <name|all>"
+  local n targets
+  targets=$(expand_targets "$1")
+  for n in $targets; do
+    compose "$n" down
+  done
+}
+
+cmd_restart() {
+  (($# == 1)) || die "usage: lettucectl restart <name|all>"
+  cmd_down "$1"
+  cmd_up "$1"
+}
+
+cmd_check() {
+  (($# == 1)) || die "usage: lettucectl check <name|all>"
+  local n targets
+  require_initialised
+  targets=$(expand_targets "$1")
+  for n in $targets; do
+    check_stack "$n"
+    info "$n: ok"
+  done
+}
+
+cmd_status() {
+  local n
+  while read -r n; do
+    printf '== %s  https://%s\n' "$n" "$(env_get "$(stack_env "$n")" LETTUCE_HOSTNAME)"
+    compose "$n" ps --format 'table {{.Service}}\t{{.Status}}'
+  done < <(list_stacks)
+}
+
+cmd_list() {
+  local n f
+  while read -r n; do
+    f=$(stack_env "$n")
+    printf '%-20s https://%-40s %s\n' "$n" "$(env_get "$f" LETTUCE_HOSTNAME)" "$(env_get "$f" ALLOWED_USERS)"
+  done < <(list_stacks)
+}
+
+cmd_logs() {
+  (($# >= 1)) || die "usage: lettucectl logs <name> [service]"
+  validate_name "$1"
+  require_stack "$1"
+  compose "$1" logs -f --tail=200 "${@:2}"
+}
+
+cmd_compose() {
+  (($# >= 2)) || die "usage: lettucectl compose <name> <args...>"
+  validate_name "$1"
+  require_stack "$1"
+  compose "$@"
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    init | add | users | remove | upgrade | up | down | restart | check | status | list | logs | compose)
+      "cmd_$cmd" "$@"
+      ;;
+    help | -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

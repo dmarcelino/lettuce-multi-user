@@ -1,0 +1,26 @@
+# Merged by lettucectl on top of upstream/docker/compose.yml for every stack.
+# Limits and no-new-privileges only; no paths, so file resolution stays with the
+# upstream file. Entries for services whose profile is off are ignored.
+services:
+  app-server:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 8g
+    pids_limit: 4096
+  bff:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+  cloudflared:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+  searxng:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+  ddg-mcp:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+  google-mcp:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+  channel-gateway:
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g

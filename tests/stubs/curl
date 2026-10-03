@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Test stub for curl against the Cloudflare API. Records each call as
+# "METHOD PATH BODY" in $STUB_LOG, the raw argv in $STUB_ARGV and stdin (the
+# curl config carrying the token) in $STUB_STDIN, and answers with canned ids:
+# account acc1, zone zone1, policy pol1, app app1 (aud aud1), tunnel tun1
+# (token tuntok1), DNS record rec1.
+# stub.env settings:
+#   STUB_CF_FAIL="METHOD /path"   that call returns success:false
+#   STUB_CF_TAKEN="host ..."      DNS names that already exist in the zone
+# Settings come from $STUB_ROOT/stub.env, not the environment: lettucectl runs
+# docker under `env -i`. Tests copy the stubs to $STUB_ROOT/bin.
+STUB_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=/dev/null
+[[ -f $STUB_ROOT/stub.env ]] && . "$STUB_ROOT/stub.env"
+STUB_LOG=$STUB_ROOT/calls.log STUB_ARGV=$STUB_ROOT/argv.log STUB_STDIN=$STUB_ROOT/stdin.log
+method=GET url="" body=""
+printf '%s\n' "$*" >>"$STUB_ARGV"
+cat >>"$STUB_STDIN"
+while (($#)); do
+  case $1 in
+    -X) method=$2; shift ;;
+    --data-binary | --data | -d) body=$2; shift ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+path=${url#https://api.cloudflare.com/client/v4}
+printf 'curl %s %s %s\n' "$method" "$path" "$body" >>"$STUB_LOG"
+
+ok() { printf '{"success":true,"errors":[],"messages":[],"result":%s}\n' "$1"; }
+if [[ -n ${STUB_CF_FAIL:-} && "$method ${path%%\?*}" == "$STUB_CF_FAIL" ]]; then
+  echo '{"success":false,"errors":[{"code":1000,"message":"stubbed failure"}],"result":null}'
+  exit 0
+fi
+case "$method ${path%%\?*}" in
+  "GET /zones")
+    if [[ -n ${STUB_CF_NO_ZONE:-} ]]; then ok '[]'; else ok '[{"id":"zone1","name":"example.org","account":{"id":"acc1"}}]'; fi ;;
+  "GET /accounts/acc1/access/organizations") ok '{"auth_domain":"team.cloudflareaccess.com"}' ;;
+  "GET /accounts/acc1/access/identity_providers")
+    if [[ -n ${STUB_CF_NO_GOOGLE:-} ]]; then ok '[{"id":"idp-gh","type":"github"}]'
+    else ok '[{"id":"idp-gh","type":"github"},{"id":"idp-g","type":"google"}]'; fi ;;
+  "GET /zones/zone1/dns_records")
+    q=${path#*name.exact=}; q=${q%%&*}
+    if [[ " ${STUB_CF_TAKEN:-} " == *" $q "* ]]; then ok '[{"id":"r0"}]'; else ok '[]'; fi ;;
+  "POST /accounts/acc1/access/policies") ok '{"id":"pol1"}' ;;
+  "PUT /accounts/acc1/access/policies/pol1") ok '{"id":"pol1"}' ;;
+  "POST /accounts/acc1/access/apps") ok '{"id":"app1","aud":"aud1"}' ;;
+  "POST /accounts/acc1/cfd_tunnel") ok '{"id":"tun1"}' ;;
+  "GET /accounts/acc1/cfd_tunnel/tun1/token") ok '"tuntok1"' ;;
+  "PUT /accounts/acc1/cfd_tunnel/tun1/configurations") ok '{}' ;;
+  "POST /zones/zone1/dns_records") ok '{"id":"rec1"}' ;;
+  DELETE*) ok '{"id":"deleted"}' ;;
+  *) echo '{"success":false,"errors":[{"code":0,"message":"stub: unknown route"}],"result":null}' ;;
+esac
