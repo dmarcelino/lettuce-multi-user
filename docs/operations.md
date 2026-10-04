@@ -33,21 +33,21 @@ Each person sets up their own stack in the Lettuce UI:
 Provider keys live in that stack's `state/letta-data`, never in this repo.
 
 ## Optional features
-Optional features are compose profiles, set in `PROFILES` in `config.env` for **all** stacks (upstream `docs/CONFIGURATION.md` lists them):
+Optional features are compose profiles, the same list for **all** stacks (upstream `docs/CONFIGURATION.md` lists them):
 - `search`: SearXNG + DuckDuckGo page reader for the agents' web tools.
 - `claude`: Claude Code CLI workers. `codex` does the same for Codex.
-- `google`: Gmail/Calendar/Tasks/Contacts sidecar.
-  - Each person connects it in Settings -> Google.
-  - It needs a Google OAuth client with redirect `https://<host>/api/google/oauth/callback`, one redirect URI per stack.
+- `google`: Gmail/Calendar/Tasks/Contacts sidecar. It needs a Google OAuth client and each person connects their own account: see **[google-setup.md](google-setup.md)**.
 - `telegram`: Telegram channel gateway.
 
-After changing `PROFILES`, rewrite it in every stack (see "Config changes") and run `./lettucectl up all`. `codex` and `claude` change the app-server image, and `up` rebuilds it.
+```bash
+./lettucectl profiles                              # show config.env and every stack
+./lettucectl profiles cloudflared,search,google    # set the list everywhere, then up all
+```
+`profiles` writes `PROFILES` in `config.env` and `COMPOSE_PROFILES` in every `stack.env` together, removes the containers of profiles you dropped (Compose would leave them running), and runs `up all`. `codex` and `claude` change the app-server image, and `up` rebuilds it. The list must contain `cloudflared`.
 
 ## Config changes
-`config.env` values are copied into each `stack.env` when the stack is created. To change `TZ` or `PROFILES` for existing stacks, edit both files, then run `./lettucectl up all`. For example:
-```bash
-sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=cloudflared,search,claude/' stacks/*/stack.env
-```
+`config.env` values are copied into each `stack.env` when the stack is created. Use `profiles` for the profile list. To change `TZ` for existing stacks, edit `config.env` and every `stack.env`, then run `./lettucectl up all`.
+
 `check` (run by every `up`) refuses a stack whose profiles differ from `config.env`.
 
 ## Upgrading Lettuce

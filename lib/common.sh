@@ -86,6 +86,31 @@ has_profile() {
   return 1
 }
 
+# normalise_profiles "cloudflared, search" -> "cloudflared,search" (dies on a bad
+# name, a duplicate, or a list without cloudflared)
+normalise_profiles() {
+  local IFS=, p out=()
+  for p in $1; do
+    p=$(printf '%s' "$p" | tr -d '[:space:]')
+    [[ -z $p ]] && continue
+    [[ $p =~ ^[a-z][a-z0-9_-]*$ ]] || die "invalid profile name '$p'"
+    if ((${#out[@]})) && has_profile "${out[*]}" "$p"; then
+      die "profile '$p' is listed twice"
+    fi
+    out+=("$p")
+  done
+  if ((${#out[@]} == 0)) || ! has_profile "${out[*]}" cloudflared; then
+    die "the profile list must contain cloudflared"
+  fi
+  printf '%s' "${out[*]}"
+}
+
+# google_redirect_uri NAME -> the OAuth redirect URI that stack's Settings -> Google
+# uses; upstream derives it from PUBLIC_ORIGIN.
+google_redirect_uri() {
+  printf '%s/api/google/oauth/callback' "$(env_get "$(stack_env "$1")" PUBLIC_ORIGIN)"
+}
+
 # ── validation ───────────────────────────────────────────────────────────────
 validate_name() {
   [[ $1 =~ ^[a-z][a-z0-9-]{0,19}$ && $1 != *- ]] ||
@@ -199,7 +224,7 @@ check_stack() {
   profiles=$(env_get "$f" COMPOSE_PROFILES)
   has_profile "$profiles" cloudflared || die "$name: COMPOSE_PROFILES must contain cloudflared"
   [[ $profiles == "$(cfg PROFILES)" ]] ||
-    die "$name: COMPOSE_PROFILES ($profiles) differs from config.env PROFILES ($(cfg PROFILES)); all stacks share one image"
+    die "$name: COMPOSE_PROFILES ($profiles) differs from config.env PROFILES ($(cfg PROFILES)); all stacks share one image (set both with: lettucectl profiles <list>)"
   rendered=$(compose "$name" config --format json) || die "$name: docker compose config failed"
   published=$(jq '[.services[] | (.ports // []) | length] | add // 0' <<<"$rendered")
   [[ $published == 0 ]] || die "$name: $published published port(s) in the rendered config; nothing may be published"

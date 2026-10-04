@@ -21,6 +21,7 @@ Setup
   add <name> <email>[,<email>]  create a stack: hostname, Access policy + app, tunnel, DNS; start it
   users <name> <email>[,...]    replace who may sign in (Access policy and ALLOWED_USERS together)
   remove <name> [--purge]       stop a stack and delete its Cloudflare resources (--purge: its data too)
+  profiles [<p>,<p>...]         show, or set for every stack, the compose profiles (optional features)
   upgrade <tag>                 move upstream Lettuce to another tag and rebuild every stack
 
 Operation (<target> is a stack name or "all")
@@ -98,6 +99,13 @@ SESSION_SECRET=$(openssl rand -hex 32)
 CF_ACCESS_TEAM_DOMAIN=$(cfg CF_TEAM_DOMAIN)
 EOF
   )
+}
+
+# google_reminder NAME -> the step only the operator can do: Google has no API
+# for an OAuth client's redirect URIs.
+google_reminder() {
+  info "Google: add $(google_redirect_uri "$1") to your Google OAuth client's redirect URIs,"
+  info "  then connect in that stack's Settings -> Google (docs/google-setup.md)"
 }
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -195,6 +203,9 @@ cmd_add() {
   info ""
   info "'$name' is up: https://$host (sign in with Google as $emails)"
   info "First boot builds images and can take a few minutes; the hostname may need a minute to resolve."
+  if has_profile "$(cfg PROFILES)" google; then
+    google_reminder "$name"
+  fi
 }
 
 cmd_users() {
@@ -214,7 +225,7 @@ cmd_users() {
 }
 
 cmd_remove() {
-  local name=${1:-} purge="" answer f acc zone id
+  local name=${1:-} purge="" answer f acc zone id redirect
   [[ ${2:-} == --purge ]] && purge=1
   [[ -n $name && ($# == 1 || -n $purge) ]] || die "usage: lettucectl remove <name> [--purge]"
   validate_name "$name"
@@ -223,6 +234,7 @@ cmd_remove() {
   f=$(stack_env "$name")
   acc=$(cfg CF_ACCOUNT_ID)
   zone=$(cfg CF_ZONE_ID)
+  redirect=$(google_redirect_uri "$name")
 
   info "This stops '$name' and deletes its DNS record, tunnel and Access application."
   if [[ -n $purge ]]; then
@@ -268,6 +280,9 @@ cmd_remove() {
     warn "not deleted (already gone, or delete it in the Cloudflare dashboard): ${left[*]}"
     warn "their ids stay in stacks/$name/stack.env, so 'lettucectl remove $name' can retry"
   fi
+  if has_profile "$(cfg PROFILES)" google; then
+    info "Google: delete $redirect from your Google OAuth client's redirect URIs"
+  fi
   if [[ -n $purge ]]; then
     if ((${#left[@]})); then
       warn "keeping stacks/$name because Cloudflare resources are left; purge again after they are gone"
@@ -283,6 +298,50 @@ cmd_remove() {
     info "'$name' removed, data included"
   else
     info "'$name' removed from Cloudflare; data kept in $(stack_dir "$name")"
+  fi
+}
+
+cmd_profiles() {
+  (($# <= 1)) || die "usage: lettucectl profiles [<profile>,<profile>...]"
+  local new old n
+  local -A before=()
+  require_initialised
+  if (($# == 0)); then
+    printf '%-20s %s\n' config.env "$(cfg PROFILES)"
+    while read -r n; do
+      printf '%-20s %s\n' "$n" "$(env_get "$(stack_env "$n")" COMPOSE_PROFILES)"
+    done < <(list_stacks)
+    return 0
+  fi
+  new=$(normalise_profiles "$1")
+  old=$(cfg PROFILES)
+
+  # Compose leaves the containers of a dropped profile running, so note each
+  # stack's services while its stack.env still enables them.
+  while read -r n; do
+    before[$n]=$(compose "$n" config --services) || die "$n: docker compose config failed"
+  done < <(list_stacks)
+  while read -r n; do
+    env_set "$(stack_env "$n")" COMPOSE_PROFILES "$new"
+  done < <(list_stacks)
+  env_set "$(config_file)" PROFILES "$new"
+  info "profiles for every stack: $new"
+
+  local after gone
+  for n in "${!before[@]}"; do
+    after=$(compose "$n" config --services) || die "$n: docker compose config failed"
+    mapfile -t gone < <(comm -23 <(sort <<<"${before[$n]}") <(sort <<<"$after"))
+    if ((${#gone[@]})); then
+      info "$n: removing ${gone[*]}"
+      compose "$n" rm -sf "${gone[@]}" || warn "$n: could not remove ${gone[*]}"
+    fi
+  done
+  cmd_up all
+
+  if has_profile "$new" google && ! has_profile "$old" google; then
+    while read -r n; do
+      google_reminder "$n"
+    done < <(list_stacks)
   fi
 }
 
@@ -374,7 +433,7 @@ main() {
   local cmd=${1:-help}
   shift || true
   case $cmd in
-    init | add | users | remove | upgrade | up | down | restart | check | status | list | logs | compose)
+    init | add | users | remove | profiles | upgrade | up | down | restart | check | status | list | logs | compose)
       "cmd_$cmd" "$@"
       ;;
     help | -h | --help) usage ;;

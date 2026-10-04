@@ -56,7 +56,7 @@ Nobody can reach another person's stack. **Cloudflare authenticates the people; 
    ```
 3. Each person opens their URL, signs in with Google, and connects a model provider in Lettuce under **Settings -> Providers & models**. One API key per person keeps spending separate.
 
-Day-to-day commands, upgrades, backups and troubleshooting are in **[docs/operations.md](docs/operations.md)**.
+Day-to-day commands, optional features, upgrades, backups and troubleshooting are in **[docs/operations.md](docs/operations.md)**. To give agents Gmail, Calendar, Tasks and Contacts, see **[docs/google-setup.md](docs/google-setup.md)**.
 
 ## What lives where
 | Path | Tracked | What |

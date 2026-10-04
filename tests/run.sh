@@ -52,6 +52,7 @@ fail() {
 ok_rc() { [[ $RC == 0 ]] || fail "expected success, got $RC"; }
 bad_rc() { [[ $RC != 0 ]] || fail "expected failure, got success"; }
 out_has() { grep -qF -- "$1" "$OUT" || fail "output lacks: $1"; }
+out_lacks() { ! grep -qF -- "$1" "$OUT" || fail "output unexpectedly has: $1"; }
 log_has() { grep -qF -- "$1" "$T/calls.log" || fail "call log lacks: $1"; }
 log_lacks() { ! grep -qF -- "$1" "$T/calls.log" || fail "call log unexpectedly has: $1"; }
 eq() { [[ $1 == "$2" ]] || fail "expected [$2], got [$1]"; }
@@ -278,6 +279,19 @@ test_add_resumes_after_a_failure() {
   eq "$(calls | tr '\n' ';')" "POST /accounts/acc1/cfd_tunnel;GET /accounts/acc1/cfd_tunnel/tun1/token;PUT /accounts/acc1/cfd_tunnel/tun1/configurations;POST /zones/zone1/dns_records;"
 }
 
+test_add_prints_the_google_redirect_uri() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,google/' "$H/config.env"
+  ctl add alfred alfred@example.com
+  ok_rc
+  out_has "https://alfred.example.org/api/google/oauth/callback"
+}
+
+test_add_skips_the_google_hint_without_the_profile() {
+  ctl add alfred alfred@example.com
+  ok_rc
+  out_lacks "oauth/callback"
+}
+
 test_add_refuses_an_existing_stack() {
   ctl add alfred alfred@example.com
   : >"$T/calls.log"
@@ -459,6 +473,71 @@ test_remove_continues_past_already_deleted_resources() {
   ok_rc
   out_has "stubbed failure"
   log_has "curl DELETE /accounts/acc1/access/apps/app1"
+}
+
+test_remove_reminds_to_delete_the_google_redirect_uri() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,google/' "$H/config.env"
+  added
+  ctl remove alfred --purge <<<"alfred"
+  ok_rc
+  out_has "delete https://alfred.example.org/api/google/oauth/callback"
+}
+
+# ── profiles ─────────────────────────────────────────────────────────────────
+test_profiles_sets_config_and_every_stack() {
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  : >"$T/calls.log"
+  ctl profiles "cloudflared, search,google"
+  ok_rc
+  eq "$(grep ^PROFILES= "$H/config.env")" PROFILES=cloudflared,search,google
+  eq "$(senv alfred COMPOSE_PROFILES)" cloudflared,search,google
+  eq "$(senv hal COMPOSE_PROFILES)" cloudflared,search,google
+  eq "$(stat -c %a "$H/stacks/hal/stack.env")" 600
+  log_has "-p lettuce-alfred"
+  log_has "-p lettuce-hal"
+  log_has "up -d --build"
+  log_lacks " rm -sf"
+  out_has "https://alfred.example.org/api/google/oauth/callback"
+  out_has "https://hal.example.org/api/google/oauth/callback"
+}
+
+test_profiles_removes_services_of_dropped_profiles() {
+  added
+  ctl profiles cloudflared
+  ok_rc
+  log_has "-p lettuce-alfred"
+  grep -q '^docker compose -p lettuce-alfred .* rm -sf ddg-mcp searxng$' "$T/calls.log" || fail "dropped services not removed"
+  out_lacks "oauth/callback"
+}
+
+test_profiles_hint_only_when_google_is_new() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,google/' "$H/config.env"
+  added
+  ctl profiles cloudflared,google,search
+  ok_rc
+  out_lacks "oauth/callback"
+}
+
+test_profiles_refuses_a_bad_list() {
+  added
+  local l
+  for l in search "cloudflared,Search" "cloudflared,search,search" "cloudflared,a.b" ","; do
+    ctl profiles "$l"
+    bad_rc
+  done
+  eq "$(grep ^PROFILES= "$H/config.env")" PROFILES=cloudflared,search
+  eq "$(senv alfred COMPOSE_PROFILES)" cloudflared,search
+  log_lacks "up -d"
+}
+
+test_profiles_without_arguments_shows_them() {
+  added
+  ctl profiles
+  ok_rc
+  out_has "config.env"
+  grep -qE '^alfred +cloudflared,search$' "$OUT" || fail "alfred's profiles not shown"
+  log_lacks "up -d"
 }
 
 # ── list ─────────────────────────────────────────────────────────────────────
