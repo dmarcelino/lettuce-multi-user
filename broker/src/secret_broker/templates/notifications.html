@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Notifications{% endblock %}
+{% block content %}
+<h1>Notifications</h1>
+<p>Get a notification on this device whenever an agent asks for something from your vault. Tapping it opens the request; you answer on that page.</p>
+<p>On iPhone and iPad, first add this page to the Home Screen (Share, Add to Home Screen) and open it from there.</p>
+<section class="card" id="push">
+  <p id="push-status" class="muted">Checking this device...</p>
+  <button id="push-enable" hidden>Enable on this device</button>
+  <button id="push-disable" hidden>Disable on this device</button>
+  <button id="push-test" hidden>Send a test</button>
+</section>
+<p class="muted">Devices with notifications on for {{ email }}: {{ devices }}</p>
+{% if not unlocked %}<p><a href="/secrets/">Back to the vault</a></p>{% endif %}
+{% endblock %}

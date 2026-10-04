@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Request{% endblock %}
+{% block content %}
+<h1>Request</h1>
+<section class="card{% if req.status == 'pending' %} pending{% endif %}">
+{% if req.status == "pending" %}
+  {% include "_decide.html" %}
+{% else %}
+  <p><strong>{{ req.secret_name }}</strong> <span class="muted">{{ req.secret_kind }}</span></p>
+  <p>Purpose given: {{ req.purpose }}</p>
+  {% if req.status == "done" %}
+  <p>You shared: {% for k in req.shared %}{{ req.labels[k] }}{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+  {% elif req.status == "denied" %}
+  <p>You denied this request.</p>
+  {% else %}
+  <p>This request expired without an answer.</p>
+  {% endif %}
+{% endif %}
+</section>
+<p><a href="/secrets/">All requests</a></p>
+{% endblock %}

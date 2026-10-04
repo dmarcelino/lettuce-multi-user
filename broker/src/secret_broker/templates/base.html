@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf" content="{{ csrf }}">
+  <meta name="vapid" content="{{ vapid_public_key }}">
+  <meta name="theme-color" content="#2e7d32">
+  <title>{% block title %}Vault{% endblock %} - Lettuce</title>
+  <!-- use-credentials: the manifest fetch must carry the Access cookie, or Access
+       answers with its login page and the app cannot be installed. -->
+  <link rel="manifest" href="/secrets/manifest.webmanifest" crossorigin="use-credentials">
+  <link rel="icon" href="/secrets/icon-192.png">
+  <link rel="apple-touch-icon" href="/secrets/icon-192.png">
+  <link rel="stylesheet" href="/secrets/app.css">
+  <script src="/secrets/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <strong>Vault</strong>
+    {% if email and unlocked %}
+    <nav>
+      <a href="/secrets/">Requests{% if pending_count %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
+      <a href="/secrets/vault">Secrets</a>
+      <a href="/secrets/notifications">Notifications</a>
+      <a href="/secrets/audit">History</a>
+      <a href="/secrets/settings">Settings</a>
+    </nav>
+    <form method="post" action="/secrets/lock" class="lock">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="secondary">Lock</button>
+    </form>
+    {% endif %}
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  {% if email %}<footer>Signed in as {{ email }}</footer>{% endif %}
+</body>
+</html>

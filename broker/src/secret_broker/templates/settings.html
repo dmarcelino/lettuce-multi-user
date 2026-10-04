@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+{% if notice %}<p class="card">{{ notice }}</p>{% endif %}
+<h2>Change passphrase</h2>
+<form method="post" action="/secrets/settings/passphrase" class="card" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <label>Current passphrase <input type="password" name="old" required autocomplete="current-password"></label>
+  <label>New passphrase <small>(at least 12 characters)</small> <input type="password" name="new" required minlength="12" autocomplete="new-password"></label>
+  <label>New passphrase again <input type="password" name="confirm" required minlength="12" autocomplete="new-password"></label>
+  <button>Change passphrase</button>
+</form>
+<h2>Erase the vault</h2>
+<form method="post" action="/secrets/settings/reset" class="card danger" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <p>Deletes every secret and the history, for good. Use it if you want to start again with a new passphrase.</p>
+  <label>Type DELETE to confirm <input name="confirm" required></label>
+  <button class="deny">Erase everything</button>
+</form>
+{% endblock %}
