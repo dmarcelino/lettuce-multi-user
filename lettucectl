@@ -307,6 +307,7 @@ cmd_up() {
   require_initialised
   targets=$(expand_targets "$1")
   for n in $targets; do
+    ensure_push_keys "$n"
     check_stack "$n"
     info "starting $n"
     compose "$n" up -d --build --remove-orphans

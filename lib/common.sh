@@ -147,6 +147,39 @@ compose() {
     "$@"
 }
 
+# ── push notifications ───────────────────────────────────────────────────────
+# vapid_keypair -> "<public> <private>", base64url as web-push expects: the
+# uncompressed P-256 point (65 bytes) and the private scalar (32 bytes). The PEM
+# stays in memory.
+vapid_keypair() {
+  local pem pub priv
+  pem=$(openssl ecparam -name prime256v1 -genkey -noout) || die "openssl could not generate a VAPID key"
+  pub=$(openssl ec -pubout -outform DER 2>/dev/null <<<"$pem" | tail -c 65 | base64url)
+  priv=$(openssl ec -outform DER 2>/dev/null <<<"$pem" | tail -c +8 | head -c 32 | base64url)
+  ((${#pub} == 87 && ${#priv} == 43)) || die "openssl produced a malformed VAPID key"
+  printf '%s %s' "$pub" "$priv"
+}
+
+base64url() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
+
+# ensure_push_keys NAME -> gives the stack a VAPID keypair once and keeps it:
+# a new keypair would invalidate every browser subscription. The contact address
+# follows config.env.
+ensure_push_keys() {
+  local f contact pair
+  f=$(stack_env "$1")
+  contact=$(cfg PUSH_CONTACT_EMAIL)
+  [[ -n $contact ]] || die "PUSH_CONTACT_EMAIL is empty in config.env; set it to the operator's email address"
+  contact=$(normalise_emails "$contact")
+  [[ $contact != *,* ]] || die "PUSH_CONTACT_EMAIL in config.env must be a single address"
+  [[ $(env_get "$f" PUSH_VAPID_CONTACT_EMAIL) == "$contact" ]] || env_set "$f" PUSH_VAPID_CONTACT_EMAIL "$contact"
+  if [[ -z $(env_get "$f" PUSH_VAPID_PUBLIC_KEY) || -z $(env_get "$f" PUSH_VAPID_PRIVATE_KEY) ]]; then
+    pair=$(vapid_keypair)
+    env_set "$f" PUSH_VAPID_PUBLIC_KEY "${pair% *}"
+    env_set "$f" PUSH_VAPID_PRIVATE_KEY "${pair#* }"
+  fi
+}
+
 # check_stack NAME -> dies with the first reason the stack must not start.
 check_stack() {
   local name=$1 f k profiles rendered published updating
@@ -157,7 +190,8 @@ check_stack() {
     die "$name: DEV_BYPASS_* is set; it would bypass Cloudflare Access entirely"
   fi
   for k in SESSION_SECRET LETTA_STATE_DIR PUBLIC_ORIGIN ALLOWED_USERS COMPOSE_PROFILES \
-    CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD CLOUDFLARE_TUNNEL_TOKEN; do
+    CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD CLOUDFLARE_TUNNEL_TOKEN \
+    PUSH_VAPID_PUBLIC_KEY PUSH_VAPID_PRIVATE_KEY PUSH_VAPID_CONTACT_EMAIL; do
     [[ -n $(env_get "$f" "$k") ]] || die "$name: $k is empty"
   done
   k=$(env_get "$f" SESSION_SECRET)
