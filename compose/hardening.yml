@@ -1,11 +1,21 @@
 # Merged by lettucectl on top of upstream/docker/compose.yml for every stack.
-# Limits and no-new-privileges only; no paths, so file resolution stays with the
-# upstream file. Entries for services whose profile is off are ignored.
+# Limits, no-new-privileges and the letta-code self-update switch only; no paths,
+# so file resolution stays with the upstream file. Entries for services whose
+# profile is off are ignored.
+#
+# DISABLE_AUTOUPDATER: every `letta` process (including the subagents the server
+# spawns) otherwise runs `npm install -g @letta-ai/letta-code@latest` inside the
+# container whenever a newer release exists. npm moves the pinned install aside
+# while it works, so the running server loses files such as
+# image-resize-worker.js, and a successful update would break the version pin.
+# `lettucectl check` refuses a stack where this is not set.
 services:
   app-server:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 8g
     pids_limit: 4096
+    environment:
+      DISABLE_AUTOUPDATER: "1"
   bff:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 1g
@@ -24,3 +34,5 @@ services:
   channel-gateway:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 1g
+    environment:
+      DISABLE_AUTOUPDATER: "1"

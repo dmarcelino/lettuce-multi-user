@@ -24,7 +24,7 @@ setup() {
     -e 's/^CF_TEAM_DOMAIN=.*/CF_TEAM_DOMAIN=team/' -e 's/^CF_GOOGLE_IDP_ID=.*/CF_GOOGLE_IDP_ID=idp-g/' \
     "$ROOT/config.env.example" >"$H/config.env"
   chmod 600 "$H/config.env"
-  echo '{"services":{"app-server":{"ports":[]},"bff":{}}}' >"$T/compose-config.json"
+  echo '{"services":{"app-server":{"ports":[],"environment":{"DISABLE_AUTOUPDATER":"1"}},"bff":{}}}' >"$T/compose-config.json"
   touch "$T/calls.log" "$T/argv.log" "$T/stdin.log" "$T/stub.env"
   OUT=$T/out
 }
@@ -320,6 +320,24 @@ test_up_refuses_published_ports() {
   ctl up alfred
   bad_rc
   out_has "published port"
+  log_lacks "up -d"
+}
+
+test_up_refuses_auto_update() {
+  added
+  echo '{"services":{"app-server":{"ports":[],"environment":{}}}}' >"$T/compose-config.json"
+  ctl up alfred
+  bad_rc
+  out_has "DISABLE_AUTOUPDATER"
+  log_lacks "up -d"
+}
+
+test_up_refuses_auto_update_in_channel_gateway() {
+  added
+  echo '{"services":{"app-server":{"environment":{"DISABLE_AUTOUPDATER":"1"}},"channel-gateway":{}}}' >"$T/compose-config.json"
+  ctl up alfred
+  bad_rc
+  out_has "channel-gateway"
   log_lacks "up -d"
 }
 

@@ -149,7 +149,7 @@ compose() {
 
 # check_stack NAME -> dies with the first reason the stack must not start.
 check_stack() {
-  local name=$1 f k profiles rendered published
+  local name=$1 f k profiles rendered published updating
   f=$(stack_env "$name")
   [[ -f $f ]] || die "$name: stack.env missing"
   [[ $(file_mode "$f") == 600 ]] || die "$name: stack.env must be mode 600"
@@ -169,4 +169,9 @@ check_stack() {
   rendered=$(compose "$name" config --format json) || die "$name: docker compose config failed"
   published=$(jq '[.services[] | (.ports // []) | length] | add // 0' <<<"$rendered")
   [[ $published == 0 ]] || die "$name: $published published port(s) in the rendered config; nothing may be published"
+  updating=$(jq -r '[.services | to_entries[]
+    | select(.key == "app-server" or .key == "channel-gateway")
+    | select(.value.environment.DISABLE_AUTOUPDATER != "1") | .key] | join(", ")' <<<"$rendered")
+  [[ -z $updating ]] ||
+    die "$name: DISABLE_AUTOUPDATER is not 1 for $updating; letta-code would reinstall itself over the pinned version (compose/hardening.yml)"
 }

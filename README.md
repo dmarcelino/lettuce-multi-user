@@ -62,7 +62,7 @@ Day-to-day commands, upgrades, backups and troubleshooting are in **[docs/operat
 | Path | Tracked | What |
 |---|---|---|
 | `lettucectl`, `lib/` | yes | the CLI |
-| `compose/hardening.yml` | yes | `no-new-privileges`, memory/pid caps for every service |
+| `compose/hardening.yml` | yes | `no-new-privileges`, memory/pid caps for every service, letta-code self-update off |
 | `compose/multi.yml` | yes | drops all published ports, so stacks never collide |
 | `config.env.example` | yes | template for `config.env` |
 | `scripts/dns-preflight.sh` | yes | compares two nameservers before and after moving a domain |

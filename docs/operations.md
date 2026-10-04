@@ -86,6 +86,7 @@ The named volume `lettuce-<name>_bff-data` holds push-notification subscriptions
 | `add`: Cloudflare API error 10000 / authentication | The token lacks a permission listed in cloudflare-setup.md step 5. |
 | `init`: zone not found | The domain isn't on this Cloudflare account yet, or the token lacks Zone Read for it. |
 | `check`: profiles differ | See "Config changes". |
+| Image attachment fails: "the image processing worker is missing from this installation" | letta-code's self-updater ran `npm install -g` inside the app-server and moved the install aside. `compose/hardening.yml` sets `DISABLE_AUTOUPDATER=1` and `check` enforces it; recreate the stack with `./lettucectl up <name>`. Do not reinstall letta-code inside the container. |
 | A wildcard warning during `add` | The domain has a `*` record, so public DNS can't show which names are free. Only the Cloudflare zone is checked. |
 
 ## Security notes
