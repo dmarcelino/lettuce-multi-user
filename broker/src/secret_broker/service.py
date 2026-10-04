@@ -1,16 +1,17 @@
 """What agents can do with the vault, shared by the MCP tools and the web UI.
 
-An agent lists items (names and field labels, never values), asks for some
-fields of one item with a purpose, and gets the values once the user has
-approved, or straight away for items the user set to "share without asking".
-Requests and results live only in memory: a restart locks the vault anyway.
+An agent lists secrets (names, types and public fields; never private values),
+asks for the private fields of one secret with a purpose, and gets them once
+the user has approved, or straight away for secrets the user set to "share
+without asking". Requests and results live only in memory: a restart locks the
+vault anyway.
 """
 
 from __future__ import annotations
 
 import logging
-import secrets
 from dataclasses import dataclass, field
+from secrets import token_urlsafe
 from typing import Any
 
 import anyio
@@ -19,7 +20,7 @@ from .config import MAX_PENDING, MAX_PURPOSE_LENGTH, MAX_WAIT_SECONDS, REQUEST_T
 from .kinds import preview
 from .logs import SECRET_FILTER
 from .push import Pusher
-from .vault import AUTO, Item, Locked, Vault, VaultError
+from .vault import AUTO, Locked, Secret, Vault, VaultError
 
 log = logging.getLogger("secret_broker")
 
@@ -31,12 +32,12 @@ UNLOCK_NOTICE_SECONDS = 300
 @dataclass
 class Request:
     id: str
-    item_id: str
-    item_name: str
-    item_kind: str
-    fields: tuple[str, ...]  # keys, in the item's order
+    secret_id: str
+    secret_name: str
+    secret_kind: str
+    details: dict[str, str]  # the secret's public fields, as context for the user
+    fields: tuple[str, ...]  # private field keys asked for, in the secret's order
     labels: dict[str, str]
-    sensitive: frozenset[str]
     purpose: str
     preview: str
     created_at: int
@@ -115,89 +116,95 @@ class Broker:
         return self._requests.get(rid)
 
     # ── agent side ───────────────────────────────────────────────────────────
-    def list_items(self) -> dict[str, Any]:
+    def list_secrets(self) -> dict[str, Any]:
         try:
-            items = self.vault.items()
+            found = self.vault.secrets()
         except Locked:
             return self._locked_answer()
         return {
-            "items": [
+            "secrets": [
                 {
-                    "id": i.id,
-                    "name": i.name,
-                    "type": i.kind_label,
-                    "use_for": i.usage,
-                    "fields": [{"key": f.key, "label": f.label} for f in i.fields],
-                    "needs_approval": i.share_mode != AUTO,
+                    "id": s.id,
+                    "name": s.name,
+                    "type": s.kind_label,
+                    "use_for": s.usage,
+                    "details": {f.label: f.value for f in s.public_fields},
+                    "private_fields": [{"key": f.key, "label": f.label} for f in s.private_fields],
+                    "needs_approval": s.share_mode != AUTO,
                 }
-                for i in items
+                for s in found
             ]
         }
 
     @staticmethod
-    def _values(item: Item, keys: tuple[str, ...]) -> dict[str, str]:
-        return {k: f.value for k in keys if (f := item.field(k)) is not None}
+    def _values(secret: Secret, keys: tuple[str, ...]) -> dict[str, str]:
+        return {k: f.value for k in keys if (f := secret.field(k)) is not None}
 
-    async def request_item(self, item_id: str, fields: list[str], purpose: str) -> dict[str, Any]:
-        if not isinstance(item_id, str) or not isinstance(purpose, str) or not isinstance(fields, list):
-            return {"status": "refused", "error": "item_id and purpose must be strings, fields a list"}
+    async def request_secret(self, secret_id: str, purpose: str, fields: list[str] | None = None) -> dict[str, Any]:
+        if not isinstance(secret_id, str) or not isinstance(purpose, str):
+            return {"status": "refused", "error": "secret_id and purpose must be strings"}
+        if fields is not None and not isinstance(fields, list):
+            return {"status": "refused", "error": "fields must be a list of private field keys"}
         purpose = purpose.strip()
         if not purpose or len(purpose) > MAX_PURPOSE_LENGTH:
             return {"status": "refused", "error": f"say what the values are for (1-{MAX_PURPOSE_LENGTH} characters)"}
         try:
-            item = self.vault.item(item_id)
+            secret = self.vault.secret(secret_id)
         except Locked:
             return self._locked_answer()
-        if item is None:
-            return {"status": "refused", "error": f"no item '{item_id}' (see list_items)"}
-        wanted = {f for f in fields if isinstance(f, str)}
-        unknown = wanted - {f.key for f in item.fields}
-        if unknown or not wanted:
-            known = ", ".join(f.key for f in item.fields)
-            return {"status": "refused", "error": f"ask for one or more of this item's fields: {known}"}
-        keys = tuple(f.key for f in item.fields if f.key in wanted)
-        labels = ", ".join(item.field(k).label for k in keys)  # type: ignore[union-attr]
+        if secret is None:
+            return {"status": "refused", "error": f"no secret '{secret_id}' (see list_secrets)"}
+        private = {f.key for f in secret.private_fields}
+        wanted = private if not fields else {f for f in fields if isinstance(f, str)}
+        public = wanted & {f.key for f in secret.public_fields}
+        if public:
+            return {"status": "refused", "error": f"{', '.join(sorted(public))}: already in list_secrets"}
+        if not wanted or wanted - private:
+            known = ", ".join(f.key for f in secret.private_fields)
+            return {"status": "refused", "error": f"ask for one or more of this secret's private fields: {known}"}
+        keys = tuple(f.key for f in secret.private_fields if f.key in wanted)
+        labels = ", ".join(secret.field(k).label for k in keys)  # type: ignore[union-attr]
 
-        if item.share_mode == AUTO:
-            values = self._values(item, keys)
+        if secret.share_mode == AUTO:
+            values = self._values(secret, keys)
             with SECRET_FILTER.guarding(values.values()):
                 self.vault.audit(
-                    "agent", "shared without asking", item.id, f"{item.name}: {labels}. Purpose: {purpose}"
+                    "agent", "shared without asking", secret.id, f"{secret.name}: {labels}. Purpose: {purpose}"
                 )
-                log.info("shared without asking item=%s fields=%s", item.id, ",".join(keys))
+                log.info("shared without asking secret=%s fields=%s", secret.id, ",".join(keys))
             self._spawn_push(
                 {
                     "title": "Shared with an agent",
-                    "body": f"{item.name}: {labels}",
+                    "body": f"{secret.name}: {labels}",
                     "url": "/secrets/audit",
-                    "tag": f"vault-shared-{item.id}",
+                    "tag": f"vault-shared-{secret.id}",
                 }
             )
-            return {"status": DONE, "item": item.name, "values": values}
+            return {"status": DONE, "secret": secret.name, "values": values}
 
         self.expire()
         if sum(1 for r in self._requests.values() if r.status == PENDING) >= MAX_PENDING:
             return {"status": "refused", "error": "too many requests are waiting; ask the user to answer them first"}
         now = self.vault.now()
         req = Request(
-            id=secrets.token_urlsafe(16),
-            item_id=item.id,
-            item_name=item.name,
-            item_kind=item.kind_label,
+            id=token_urlsafe(16),
+            secret_id=secret.id,
+            secret_name=secret.name,
+            secret_kind=secret.kind_label,
+            details={f.label: f.value for f in secret.public_fields},
             fields=keys,
-            labels={k: item.field(k).label for k in keys},  # type: ignore[union-attr]
-            sensitive=frozenset(k for k in keys if item.field(k).sensitive),  # type: ignore[union-attr]
+            labels={k: secret.field(k).label for k in keys},  # type: ignore[union-attr]
             purpose=purpose,
-            preview=preview(item.kind, list(item.fields)),
+            preview=preview(secret.kind, list(secret.fields)),
             created_at=now,
             expires_at=now + REQUEST_TTL_SECONDS,
         )
         self._requests[req.id] = req
-        log.info("pending id=%s item=%s fields=%s", req.id, item.id, ",".join(keys))
+        log.info("pending id=%s secret=%s fields=%s", req.id, secret.id, ",".join(keys))
         self._spawn_push(
             {
                 "title": "Approve sharing",
-                "body": f"{item.name}: {labels}",
+                "body": f"{secret.name}: {labels}",
                 "url": f"/secrets/r/{req.id}",
                 "tag": f"vault-request-{req.id}",
             }
@@ -225,7 +232,7 @@ class Broker:
         if req.values is None:
             return {"id": rid, "status": DONE, "note": "the values were already returned"}
         values, req.values = req.values, None
-        result: dict[str, Any] = {"id": rid, "status": DONE, "item": req.item_name, "values": values}
+        result: dict[str, Any] = {"id": rid, "status": DONE, "secret": req.secret_name, "values": values}
         withheld = [req.labels[k] for k in req.fields if k not in req.shared]
         if withheld:
             result["withheld"] = withheld
@@ -239,22 +246,22 @@ class Broker:
         now = self.vault.now()
         if not approve:
             req.status, req.decided_by, req.decided_at = DENIED, email, now
-            self.vault.audit(email, "denied", req.item_id, f"{req.item_name}. Purpose: {req.purpose}")
+            self.vault.audit(email, "denied", req.secret_id, f"{req.secret_name}. Purpose: {req.purpose}")
             return req
         shared = tuple(k for k in req.fields if k in set(fields))
         if not shared:
             raise VaultError("tick at least one field to share, or deny")
-        item = self.vault.item(req.item_id)
-        if item is None:
-            raise VaultError("that item was deleted")
-        values = self._values(item, shared)
+        secret = self.vault.secret(req.secret_id)
+        if secret is None:
+            raise VaultError("that secret was deleted")
+        values = self._values(secret, shared)
         if len(values) != len(shared):
-            raise VaultError("that item changed; ask the agent to request it again")
+            raise VaultError("that secret changed; ask the agent to request it again")
         labels = ", ".join(req.labels[k] for k in shared)
         with SECRET_FILTER.guarding(values.values()):
             self.vault.audit(
-                email, "shared on approval", req.item_id, f"{req.item_name}: {labels}. Purpose: {req.purpose}"
+                email, "shared on approval", req.secret_id, f"{req.secret_name}: {labels}. Purpose: {req.purpose}"
             )
-            log.info("approved id=%s item=%s fields=%s by=%s", rid, req.item_id, ",".join(shared), email)
+            log.info("approved id=%s secret=%s fields=%s by=%s", rid, req.secret_id, ",".join(shared), email)
         req.status, req.decided_by, req.decided_at, req.shared, req.values = DONE, email, now, shared, values
         return req

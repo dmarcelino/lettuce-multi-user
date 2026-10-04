@@ -1,7 +1,7 @@
 """The encrypted vault: one SQLite file on the broker-only volume.
 
-On disk in plaintext: item ids, kinds, sharing modes, timestamps, audit
-actions and push subscriptions. Item names, usage notes, fields and audit
+On disk in plaintext: secret ids, kinds, sharing modes, timestamps, audit
+actions and push subscriptions. Secret names, usage notes, fields and audit
 details are encrypted (crypto.py). The data key lives only in this process,
 from unlock until lock, auto-lock or restart.
 """
@@ -10,21 +10,21 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import sqlite3
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from secrets import token_hex
 from typing import Any
 
 from . import crypto
-from .config import AUTO_LOCK_SECONDS, MAX_FIELD_VALUE, MAX_FIELDS, MIN_PASSPHRASE_LENGTH
-from .kinds import KINDS, slug
+from .config import AUTO_LOCK_SECONDS, MAX_FIELD_VALUE, MIN_PASSPHRASE_LENGTH
+from .kinds import KINDS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
-CREATE TABLE IF NOT EXISTS items (
+CREATE TABLE IF NOT EXISTS secrets (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
   share_mode TEXT NOT NULL,
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS audit (
   at INTEGER NOT NULL,
   actor TEXT NOT NULL,
   action TEXT NOT NULL,
-  item_id TEXT,
+  item_id TEXT, -- the secret's id; column name kept from the first schema
   blob BLOB
 );
 CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
@@ -73,7 +73,7 @@ class Field:
 
 
 @dataclass(frozen=True)
-class Item:
+class Secret:
     id: str
     kind: str
     share_mode: str
@@ -87,6 +87,14 @@ class Item:
         return next((f for f in self.fields if f.key == key), None)
 
     @property
+    def public_fields(self) -> tuple[Field, ...]:
+        return tuple(f for f in self.fields if not f.sensitive)
+
+    @property
+    def private_fields(self) -> tuple[Field, ...]:
+        return tuple(f for f in self.fields if f.sensitive)
+
+    @property
     def kind_label(self) -> str:
         return KINDS[self.kind].label if self.kind in KINDS else self.kind
 
@@ -96,7 +104,7 @@ class AuditEntry:
     at: int
     actor: str
     action: str
-    item_id: str | None
+    secret_id: str | None
     detail: str
 
 
@@ -116,31 +124,20 @@ def check_passphrase(passphrase: str) -> str:
     return passphrase
 
 
-def build_fields(kind: str, values: dict[str, str], custom: list[tuple[str, str, bool]]) -> tuple[Field, ...]:
-    """The kind's fields in order, then custom ones. Empty fields are dropped."""
+def build_fields(kind: str, values: dict[str, str]) -> tuple[Field, ...]:
+    """The kind's fields in order; empty optional fields are dropped."""
     if kind not in KINDS:
-        raise VaultError("unknown item type")
+        raise VaultError("unknown type of secret")
     out: list[Field] = []
     for spec in KINDS[kind].fields:
         value = values.get(spec.key, "").strip()
-        if value:
-            out.append(Field(spec.key, spec.label, value, spec.sensitive, spec.multiline))
-    taken = {spec.key for spec in KINDS[kind].fields}
-    for label, value, sensitive in custom:
-        label, value = label.strip()[:60], value.strip()
-        if not label or not value:
+        if not value:
+            if spec.required:
+                raise VaultError(f"{spec.label} is required")
             continue
-        key = slug(label)
-        n = 2
-        while key in taken:
-            key = f"{slug(label)}_{n}"
-            n += 1
-        taken.add(key)
-        out.append(Field(key, label, value, sensitive, "\n" in value))
-    if not out:
-        raise VaultError("fill in at least one field")
-    if len(out) > MAX_FIELDS or any(len(f.value) > MAX_FIELD_VALUE for f in out):
-        raise VaultError(f"at most {MAX_FIELDS} fields of {MAX_FIELD_VALUE} characters each")
+        if len(value) > MAX_FIELD_VALUE:
+            raise VaultError(f"{spec.label} is longer than {MAX_FIELD_VALUE} characters")
+        out.append(Field(spec.key, spec.label, value, spec.sensitive, spec.multiline))
     return tuple(out)
 
 
@@ -269,7 +266,7 @@ class Vault:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                for table in ("items", "audit", "vault_meta"):
+                for table in ("secrets", "audit", "vault_meta"):
                     self._db.execute(f"DELETE FROM {table}")
                 self._db.execute("COMMIT")
             except BaseException:
@@ -278,10 +275,10 @@ class Vault:
             self._db.execute("VACUUM")
             self._state = None
 
-    # ── items ────────────────────────────────────────────────────────────────
-    def _decode(self, row: sqlite3.Row, key: bytes) -> Item:
-        data = json.loads(crypto.open_sealed(key, bytes(row["blob"]), f"item:{row['id']}".encode()))
-        return Item(
+    # ── secrets ──────────────────────────────────────────────────────────────
+    def _decode(self, row: sqlite3.Row, key: bytes) -> Secret:
+        data = json.loads(crypto.open_sealed(key, bytes(row["blob"]), f"secret:{row['id']}".encode()))
+        return Secret(
             id=row["id"],
             kind=row["kind"],
             share_mode=row["share_mode"],
@@ -292,75 +289,73 @@ class Vault:
             updated_at=row["updated_at"],
         )
 
-    def _encode(self, item_id: str, name: str, usage: str, fields: tuple[Field, ...], key: bytes) -> bytes:
+    def _encode(self, secret_id: str, name: str, usage: str, fields: tuple[Field, ...], key: bytes) -> bytes:
         data = {
             "name": name,
             "usage": usage,
             "fields": [f.__dict__ for f in fields],
         }
-        return crypto.seal(key, json.dumps(data).encode(), f"item:{item_id}".encode())
+        return crypto.seal(key, json.dumps(data).encode(), f"secret:{secret_id}".encode())
 
     @staticmethod
-    def _check(kind: str, name: str, share_mode: str, fields: tuple[Field, ...]) -> None:
+    def _check(kind: str, name: str, share_mode: str) -> None:
         if kind not in KINDS:
-            raise VaultError("unknown item type")
+            raise VaultError("unknown type of secret")
         if not name.strip() or len(name) > 80:
             raise VaultError("the name must be 1 to 80 characters")
         if share_mode not in (ASK, AUTO):
             raise VaultError("invalid sharing choice")
-        if share_mode == AUTO and (not KINDS[kind].auto_allowed or any(f.sensitive for f in fields)):
-            raise VaultError(
-                "only addresses, company details and memberships without hidden fields can be shared without asking"
-            )
+        if share_mode == AUTO and not KINDS[kind].auto_allowed:
+            raise VaultError(f"{KINDS[kind].label} secrets always ask before an agent uses them")
 
-    def items(self) -> list[Item]:
+    def secrets(self) -> list[Secret]:
         key = self._key()
-        items = [self._decode(r, key) for r in self._q("SELECT * FROM items")]
-        return sorted(items, key=lambda i: (i.kind_label, i.name.lower()))
+        found = [self._decode(r, key) for r in self._q("SELECT * FROM secrets")]
+        return sorted(found, key=lambda x: (x.kind_label, x.name.lower()))
 
-    def item(self, item_id: str) -> Item | None:
+    def secret(self, secret_id: str) -> Secret | None:
         key = self._key()
-        rows = self._q("SELECT * FROM items WHERE id = ?", (item_id,))
+        rows = self._q("SELECT * FROM secrets WHERE id = ?", (secret_id,))
         return self._decode(rows[0], key) if rows else None
 
-    def add_item(self, kind: str, name: str, usage: str, fields: tuple[Field, ...], share_mode: str = ASK) -> str:
-        self._check(kind, name, share_mode, fields)
+    def add_secret(self, kind: str, name: str, usage: str, fields: tuple[Field, ...], share_mode: str = ASK) -> str:
+        self._check(kind, name, share_mode)
         key = self._key()
-        item_id = secrets.token_hex(8)
+        secret_id = token_hex(8)
         now = self.now()
         self._x(
-            "INSERT INTO items (id, kind, share_mode, created_at, updated_at, blob) VALUES (?, ?, ?, ?, ?, ?)",
-            (item_id, kind, share_mode, now, now, self._encode(item_id, name.strip(), usage.strip(), fields, key)),
+            "INSERT INTO secrets (id, kind, share_mode, created_at, updated_at, blob) VALUES (?, ?, ?, ?, ?, ?)",
+            (secret_id, kind, share_mode, now, now, self._encode(secret_id, name.strip(), usage.strip(), fields, key)),
         )
-        return item_id
+        return secret_id
 
-    def update_item(self, item_id: str, name: str, usage: str, fields: tuple[Field, ...], share_mode: str) -> None:
-        current = self.item(item_id)
+    def update_secret(self, secret_id: str, name: str, usage: str, fields: tuple[Field, ...], share_mode: str) -> None:
+        current = self.secret(secret_id)
         if current is None:
-            raise VaultError("no such item")
-        self._check(current.kind, name, share_mode, fields)
+            raise VaultError("no such secret")
+        self._check(current.kind, name, share_mode)
         key = self._key()
         self._x(
-            "UPDATE items SET share_mode = ?, updated_at = ?, blob = ? WHERE id = ?",
-            (share_mode, self.now(), self._encode(item_id, name.strip(), usage.strip(), fields, key), item_id),
+            "UPDATE secrets SET share_mode = ?, updated_at = ?, blob = ? WHERE id = ?",
+            (share_mode, self.now(), self._encode(secret_id, name.strip(), usage.strip(), fields, key), secret_id),
         )
 
-    def delete_item(self, item_id: str) -> None:
+    def delete_secret(self, secret_id: str) -> None:
         self._key()
-        if not self._x("DELETE FROM items WHERE id = ?", (item_id,)):
-            raise VaultError("no such item")
+        if not self._x("DELETE FROM secrets WHERE id = ?", (secret_id,)):
+            raise VaultError("no such secret")
 
     # ── audit ────────────────────────────────────────────────────────────────
-    def audit(self, actor: str, action: str, item_id: str | None = None, detail: str = "") -> None:
+    def audit(self, actor: str, action: str, secret_id: str | None = None, detail: str = "") -> None:
         """Action and actor are plaintext; the detail is encrypted, so it is
         dropped when the vault is locked (only lock events happen then)."""
-        entry_id = secrets.token_hex(8)
+        entry_id = token_hex(8)
         blob = None
         if detail and self.is_unlocked():
             blob = crypto.seal(self._key(), detail.encode(), f"audit:{entry_id}".encode())
         self._x(
             "INSERT INTO audit (id, at, actor, action, item_id, blob) VALUES (?, ?, ?, ?, ?, ?)",
-            (entry_id, self.now(), actor, action, item_id, blob),
+            (entry_id, self.now(), actor, action, secret_id, blob),
         )
 
     def audit_log(self, limit: int = 200) -> list[AuditEntry]:

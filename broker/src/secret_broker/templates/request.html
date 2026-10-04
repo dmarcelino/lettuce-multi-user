@@ -6,7 +6,7 @@
 {% if req.status == "pending" %}
   {% include "_decide.html" %}
 {% else %}
-  <p><strong>{{ req.item_name }}</strong> <span class="muted">{{ req.item_kind }}</span></p>
+  <p><strong>{{ req.secret_name }}</strong> <span class="muted">{{ req.secret_kind }}</span></p>
   <p>Purpose given: {{ req.purpose }}</p>
   {% if req.status == "done" %}
   <p>You shared: {% for k in req.shared %}{{ req.labels[k] }}{% if not loop.last %}, {% endif %}{% endfor %}.</p>

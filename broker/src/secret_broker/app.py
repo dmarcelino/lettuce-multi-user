@@ -27,7 +27,7 @@ from .config import UNLOCK_ATTEMPTS_PER_MINUTE
 from .kinds import KINDS, preview
 from .mcp_tools import build_server
 from .service import Broker
-from .vault import ASK, AUTO, Field, Item, Locked, Vault, VaultError, build_fields
+from .vault import ASK, AUTO, Field, Locked, Secret, Vault, VaultError, build_fields
 
 log = logging.getLogger("secret_broker.ui")
 
@@ -42,7 +42,6 @@ SECURITY_HEADERS = {
     "cache-control": "no-store",
     "x-frame-options": "DENY",
 }
-CUSTOM_ROWS = 2
 
 Handler = Callable[[HttpRequest, str], Awaitable[Response]]
 
@@ -143,7 +142,7 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
         except VaultError as e:
             return render("setup.html", email, status=400, problem=str(e))
         vault.audit(email, "created the vault")
-        return back("/secrets/items")
+        return back("/secrets/vault")
 
     async def unlock(request: HttpRequest, email: str) -> Response:
         form = await request.form()
@@ -204,112 +203,88 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
         broker.decide(rid, action == "share", [str(f) for f in form.getlist("fields")], email)
         return back(f"/secrets/r/{rid}")
 
-    # ── items ────────────────────────────────────────────────────────────────
-    def fields_from(form: Any, kind: str, current: Item | None) -> tuple[Field, ...]:
+    # ── secrets ──────────────────────────────────────────────────────────────
+    def fields_from(form: Any, kind: str, current: Secret | None) -> tuple[Field, ...]:
         values = {spec.key: str(form.get(f"f_{spec.key}", "")) for spec in KINDS[kind].fields}
         if current is not None:
-            # Hidden fields are never sent back to the browser: blank keeps them.
+            # Private values are never sent back to the browser: blank keeps them,
+            # unless the person ticked "Remove this value" on an optional one.
             for spec in KINDS[kind].fields:
                 old = current.field(spec.key)
-                if (
-                    spec.sensitive
-                    and not values[spec.key].strip()
-                    and old is not None
-                    and form.get(f"clear_{spec.key}") != "on"
-                ):
+                removing = not spec.required and form.get(f"clear_{spec.key}") == "on"
+                if spec.sensitive and not values[spec.key].strip() and old is not None and not removing:
                     values[spec.key] = old.value
-        custom: list[tuple[str, str, bool]] = []
-        i = 0
-        while f"c_label_{i}" in form:
-            label, value = str(form.get(f"c_label_{i}", "")), str(form.get(f"c_value_{i}", ""))
-            sensitive = form.get(f"c_sensitive_{i}") == "on"
-            old_key = str(form.get(f"c_key_{i}", ""))
-            if form.get(f"c_remove_{i}") != "on":
-                old = current.field(old_key) if current and old_key else None
-                if sensitive and not value.strip() and old is not None:
-                    value = old.value
-                custom.append((label, value, sensitive))
-            i += 1
-        return build_fields(kind, values, custom)
+        return build_fields(kind, values)
 
     def share_mode_from(form: Any) -> str:
         return AUTO if form.get("share_mode") == AUTO else ASK
 
-    def custom_fields(item: Item | None) -> list[Field]:
-        if item is None:
-            return []
-        known = {spec.key for spec in KINDS[item.kind].fields}
-        return [f for f in item.fields if f.key not in known]
+    def get_secret(request: HttpRequest) -> Secret:
+        secret = vault.secret(request.path_params["sid"])
+        if secret is None:
+            raise VaultError("no such secret")
+        return secret
 
-    async def items_page(request: HttpRequest, email: str) -> Response:
-        items = [(i, preview(i.kind, list(i.fields))) for i in vault.items()]
-        return render("items.html", email, items=items, kinds=KINDS)
+    async def secrets_page(request: HttpRequest, email: str) -> Response:
+        listed = [(s, preview(s.kind, list(s.fields))) for s in vault.secrets()]
+        return render("secrets.html", email, secrets=listed)
 
-    async def item_new(request: HttpRequest, email: str) -> Response:
+    async def secret_new(request: HttpRequest, email: str) -> Response:
         kind = request.query_params.get("kind", "")
         if kind not in KINDS:
             return render("choose_kind.html", email, kinds=KINDS)
-        return render("item_form.html", email, kind=KINDS[kind], item=None, custom=[], blank_rows=CUSTOM_ROWS)
+        return render("secret_form.html", email, kind=KINDS[kind], secret=None)
 
-    async def item_create(request: HttpRequest, email: str) -> Response:
+    async def secret_create(request: HttpRequest, email: str) -> Response:
         form = await request.form()
         kind = str(form.get("kind", ""))
         if kind not in KINDS:
-            raise VaultError("unknown item type")
-        item_id = vault.add_item(
+            raise VaultError("unknown type of secret")
+        secret_id = vault.add_secret(
             kind,
             str(form.get("name", "")),
             str(form.get("usage", "")),
             fields_from(form, kind, None),
             share_mode_from(form),
         )
-        vault.audit(email, "added item", item_id, str(form.get("name", "")))
-        return back(f"/secrets/items/{item_id}")
+        vault.audit(email, "added secret", secret_id, str(form.get("name", "")))
+        return back(f"/secrets/vault/{secret_id}")
 
-    def get_item(request: HttpRequest) -> Item:
-        item = vault.item(request.path_params["iid"])
-        if item is None:
-            raise VaultError("no such item")
-        return item
-
-    async def item_view(request: HttpRequest, email: str) -> Response:
-        item = get_item(request)
-        return render("item.html", email, item=item, revealed=False, preview=preview(item.kind, list(item.fields)))
-
-    async def item_show(request: HttpRequest, email: str) -> Response:
-        item = get_item(request)
-        vault.audit(email, "viewed hidden fields", item.id, item.name)
-        return render("item.html", email, item=item, revealed=True, preview=preview(item.kind, list(item.fields)))
-
-    async def item_edit(request: HttpRequest, email: str) -> Response:
-        item = get_item(request)
+    def show(email: str, secret: Secret, revealed: bool) -> Response:
         return render(
-            "item_form.html",
-            email,
-            kind=KINDS[item.kind],
-            item=item,
-            custom=custom_fields(item),
-            blank_rows=CUSTOM_ROWS,
+            "secret.html", email, secret=secret, revealed=revealed, preview=preview(secret.kind, list(secret.fields))
         )
 
-    async def item_update(request: HttpRequest, email: str) -> Response:
-        item = get_item(request)
+    async def secret_view(request: HttpRequest, email: str) -> Response:
+        return show(email, get_secret(request), revealed=False)
+
+    async def secret_show(request: HttpRequest, email: str) -> Response:
+        secret = get_secret(request)
+        vault.audit(email, "viewed private fields", secret.id, secret.name)
+        return show(email, secret, revealed=True)
+
+    async def secret_edit(request: HttpRequest, email: str) -> Response:
+        secret = get_secret(request)
+        return render("secret_form.html", email, kind=KINDS[secret.kind], secret=secret)
+
+    async def secret_update(request: HttpRequest, email: str) -> Response:
+        secret = get_secret(request)
         form = await request.form()
-        vault.update_item(
-            item.id,
+        vault.update_secret(
+            secret.id,
             str(form.get("name", "")),
             str(form.get("usage", "")),
-            fields_from(form, item.kind, item),
+            fields_from(form, secret.kind, secret),
             share_mode_from(form),
         )
-        vault.audit(email, "changed item", item.id, str(form.get("name", "")))
-        return back(f"/secrets/items/{item.id}")
+        vault.audit(email, "changed secret", secret.id, str(form.get("name", "")))
+        return back(f"/secrets/vault/{secret.id}")
 
-    async def item_delete(request: HttpRequest, email: str) -> Response:
-        item = get_item(request)
-        vault.delete_item(item.id)
-        vault.audit(email, "deleted item", item.id, item.name)
-        return back("/secrets/items")
+    async def secret_delete(request: HttpRequest, email: str) -> Response:
+        secret = get_secret(request)
+        vault.delete_secret(secret.id)
+        vault.audit(email, "deleted secret", secret.id, secret.name)
+        return back("/secrets/vault")
 
     # ── notifications ────────────────────────────────────────────────────────
     async def notifications(request: HttpRequest, email: str) -> Response:
@@ -388,14 +363,14 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
         Route("/settings/reset", page(reset, post=True), methods=["POST"]),
         Route("/r/{rid}", page(request_detail)),
         Route("/r/{rid}/decide", page(decide, post=True), methods=["POST"]),
-        Route("/items", page(items_page)),
-        Route("/items", page(item_create, post=True), methods=["POST"]),
-        Route("/items/new", page(item_new)),
-        Route("/items/{iid}", page(item_view)),
-        Route("/items/{iid}", page(item_update, post=True), methods=["POST"]),
-        Route("/items/{iid}/edit", page(item_edit)),
-        Route("/items/{iid}/show", page(item_show, post=True), methods=["POST"]),
-        Route("/items/{iid}/delete", page(item_delete, post=True), methods=["POST"]),
+        Route("/vault", page(secrets_page)),
+        Route("/vault", page(secret_create, post=True), methods=["POST"]),
+        Route("/vault/new", page(secret_new)),
+        Route("/vault/{sid}", page(secret_view)),
+        Route("/vault/{sid}", page(secret_update, post=True), methods=["POST"]),
+        Route("/vault/{sid}/edit", page(secret_edit)),
+        Route("/vault/{sid}/show", page(secret_show, post=True), methods=["POST"]),
+        Route("/vault/{sid}/delete", page(secret_delete, post=True), methods=["POST"]),
         Route("/notifications", page(notifications, **open_page)),
         Route("/push/subscribe", page(push_subscribe, post=True, **open_page), methods=["POST"]),
         Route("/push/unsubscribe", page(push_unsubscribe, post=True, **open_page), methods=["POST"]),

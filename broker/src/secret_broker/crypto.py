@@ -2,7 +2,7 @@
 
 A random 256-bit data key encrypts every record with AES-256-GCM. The data key
 is stored only wrapped (encrypted) with a key derived from the user's
-passphrase by scrypt, so the file alone reveals nothing but item ids, types and
+passphrase by scrypt, so the file alone reveals nothing but secret ids, types and
 timestamps. Each ciphertext is bound to its row through the associated data,
 so blobs cannot be swapped between rows.
 """

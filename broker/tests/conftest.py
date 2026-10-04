@@ -70,20 +70,20 @@ def vault(vault_path, clock) -> Vault:
     return v
 
 
+ADDRESS_TEXT = f"Alfred Test, {STREET}, 1000-001 Lisboa, Portugal"
+
+
 def add_address(vault: Vault, share_mode: str = "ask") -> str:
-    fields = build_fields(
-        "address", {"full_name": "Alfred Test", "street": STREET, "city": "Lisboa", "country": "Portugal"}, []
-    )
-    return vault.add_item("address", "Home address", "deliveries", fields, share_mode)
+    fields = build_fields("address", {"text": ADDRESS_TEXT})
+    return vault.add_secret("address", "Home address", "deliveries", fields, share_mode)
 
 
 def add_card(vault: Vault) -> str:
     fields = build_fields(
         "card",
-        {"cardholder": "Alfred Test", "number": CARD, "expiry": "12/30", "security_code": "123"},
-        [("Bank PIN hint", SECRET, True)],
+        {"cardholder": "Alfred Test", "number": CARD, "expiry": "12/30", "security_code": "123", "notes": SECRET},
     )
-    return vault.add_item("card", "Visa", "", fields)
+    return vault.add_secret("card", "Visa", "", fields)
 
 
 class FakeSender:

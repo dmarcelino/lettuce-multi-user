@@ -1,6 +1,6 @@
 """Web Push to the user's devices.
 
-Payloads are encrypted end to end (RFC 8291) and name only the item and its
+Payloads are encrypted end to end (RFC 8291) and name only the secret and its
 field labels, never a value. A failed push never decides anything: a request
 just waits until it expires.
 """

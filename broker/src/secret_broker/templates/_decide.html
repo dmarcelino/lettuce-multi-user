@@ -1,11 +1,12 @@
-{# The question the user answers: which fields of which item, and why. #}
+{# The question the user answers: which private fields of which secret, and why. #}
 <form method="post" action="/secrets/r/{{ req.id }}/decide" class="decide">
   <input type="hidden" name="csrf" value="{{ csrf }}">
-  <p><strong>{{ req.item_name }}</strong> <span class="muted">{{ req.item_kind }}{% if req.preview %} - {{ req.preview }}{% endif %}</span></p>
-  <p>An agent wants these details:</p>
+  <p><strong>{{ req.secret_name }}</strong> <span class="muted">{{ req.secret_kind }}{% if req.preview %} - {{ req.preview }}{% endif %}</span></p>
+  {% if req.details %}<p class="muted small">{% for label, value in req.details.items() %}{{ label }}: {{ value }}{% if not loop.last %} - {% endif %}{% endfor %}</p>{% endif %}
+  <p>An agent wants:</p>
   <fieldset>
     {% for key in req.fields %}
-    <label class="inline"><input type="checkbox" name="fields" value="{{ key }}" checked> {{ req.labels[key] }}{% if key in req.sensitive %} <span class="tag">private</span>{% endif %}</label>
+    <label class="inline"><input type="checkbox" name="fields" value="{{ key }}" checked> {{ req.labels[key] }}</label>
     {% endfor %}
   </fieldset>
   <p>It says it needs them to:</p>
