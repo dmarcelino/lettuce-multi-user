@@ -22,7 +22,7 @@ Menu labels were checked against Google's docs in October 2026. Labels marked *(
 ./lettucectl profiles                                  # shows the current list
 ./lettucectl profiles cloudflared,search,google        # your list plus google
 ```
-`profiles` writes the list to `config.env` and every `stack.env`, rebuilds and restarts every stack, and prints each stack's redirect URI. Copy those URIs for step 4. Later, `add` prints the URI of each new stack and `remove` reminds you to delete it.
+`profiles` checks every stack, writes the list to `config.env` and every `stack.env`, and rebuilds and restarts the stacks. Whenever the list contains `google` it prints each stack's redirect URI, even when nothing changed. Copy those URIs for step 4. Later, `add` prints the URI of each new stack and `remove` reminds you to delete it.
 
 ## 2. Google Cloud: enable the APIs
 Use the project from cloudflare-setup.md step 4.1. Its consent screen is already set up, and every client in a project shares it.
@@ -40,7 +40,7 @@ Go to **Google Auth Platform** -> **Audience**.
 - **User type: External** is needed when anyone connects a personal `@gmail.com` account. **Internal** only works for accounts of the organisation that owns the project.
 - **Publishing status: In production.** If you followed cloudflare-setup.md, it already is.
   - In **Testing**, Google ends every authorization 7 days after consent, refresh token included. Each person would have to reconnect weekly.
-  - In production but unverified, Gmail and Drive scopes are "sensitive" or "restricted". Google shows an **unverified app** warning on the consent screen, and at most 100 accounts can connect. People continue past it with **Advanced** -> **Go to \<app name\> (unsafe)** *(may differ)*. Removing the warning takes Google verification, which for Gmail scopes includes a paid security assessment.
+  - In production but unverified, most Gmail scopes are "restricted" and the Calendar, Tasks and Contacts scopes "sensitive". Google shows an **unverified app** warning on the consent screen, and at most 100 accounts can connect. People continue past it with **Advanced** -> **Go to \<app name\> (unsafe)** *(may differ)*. Removing the warning takes Google verification, which for Gmail scopes includes a paid security assessment.
   - Publishing changes nothing for the Cloudflare login. That client asks only for the basic profile scopes, which need no verification.
 - The consent screen shows the **App name** from **Branding**. People will see it when they connect, so pick a name they recognise.
 

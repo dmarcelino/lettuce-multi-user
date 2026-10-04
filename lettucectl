@@ -225,7 +225,7 @@ cmd_users() {
 }
 
 cmd_remove() {
-  local name=${1:-} purge="" answer f acc zone id redirect
+  local name=${1:-} purge="" answer f acc zone id
   [[ ${2:-} == --purge ]] && purge=1
   [[ -n $name && ($# == 1 || -n $purge) ]] || die "usage: lettucectl remove <name> [--purge]"
   validate_name "$name"
@@ -234,7 +234,6 @@ cmd_remove() {
   f=$(stack_env "$name")
   acc=$(cfg CF_ACCOUNT_ID)
   zone=$(cfg CF_ZONE_ID)
-  redirect=$(google_redirect_uri "$name")
 
   info "This stops '$name' and deletes its DNS record, tunnel and Access application."
   if [[ -n $purge ]]; then
@@ -281,7 +280,7 @@ cmd_remove() {
     warn "their ids stay in stacks/$name/stack.env, so 'lettucectl remove $name' can retry"
   fi
   if has_profile "$(cfg PROFILES)" google; then
-    info "Google: delete $redirect from your Google OAuth client's redirect URIs"
+    info "Google: delete $(google_redirect_uri "$name") from your Google OAuth client's redirect URIs"
   fi
   if [[ -n $purge ]]; then
     if ((${#left[@]})); then
@@ -303,46 +302,60 @@ cmd_remove() {
 
 cmd_profiles() {
   (($# <= 1)) || die "usage: lettucectl profiles [<profile>,<profile>...]"
-  local new old n
-  local -A before=()
-  require_initialised
+  local new n changed="" stale
+  local -a stacks gone failed=()
+  mapfile -t stacks < <(list_stacks)
   if (($# == 0)); then
+    require_config
     printf '%-20s %s\n' config.env "$(cfg PROFILES)"
-    while read -r n; do
+    for n in "${stacks[@]}"; do
       printf '%-20s %s\n' "$n" "$(env_get "$(stack_env "$n")" COMPOSE_PROFILES)"
-    done < <(list_stacks)
+    done
     return 0
   fi
+  require_initialised
   new=$(normalise_profiles "$1")
-  old=$(cfg PROFILES)
-
-  # Compose leaves the containers of a dropped profile running, so note each
-  # stack's services while its stack.env still enables them.
-  while read -r n; do
-    before[$n]=$(compose "$n" config --services) || die "$n: docker compose config failed"
-  done < <(list_stacks)
-  while read -r n; do
-    env_set "$(stack_env "$n")" COMPOSE_PROFILES "$new"
-  done < <(list_stacks)
-  env_set "$(config_file)" PROFILES "$new"
-  info "profiles for every stack: $new"
-
-  local after gone
-  for n in "${!before[@]}"; do
-    after=$(compose "$n" config --services) || die "$n: docker compose config failed"
-    mapfile -t gone < <(comm -23 <(sort <<<"${before[$n]}") <(sort <<<"$after"))
-    if ((${#gone[@]})); then
-      info "$n: removing ${gone[*]}"
-      compose "$n" rm -sf "${gone[@]}" || warn "$n: could not remove ${gone[*]}"
-    fi
+  [[ $(cfg PROFILES) == "$new" ]] || changed=1
+  for n in "${stacks[@]}"; do
+    [[ $(env_get "$(stack_env "$n")" COMPOSE_PROFILES) == "$new" ]] || changed=1
   done
-  cmd_up all
 
-  if has_profile "$new" google && ! has_profile "$old" google; then
-    while read -r n; do
-      google_reminder "$n"
-    done < <(list_stacks)
+  if [[ -n $changed ]]; then
+    # Check every stack before writing anything, so one broken stack cannot
+    # leave the others half-switched.
+    for n in "${stacks[@]}"; do
+      ensure_push_keys "$n"
+      check_stack "$n" --skip-profiles
+    done
+    for n in "${stacks[@]}"; do
+      env_set "$(stack_env "$n")" COMPOSE_PROFILES "$new"
+    done
+    env_set "$(config_file)" PROFILES "$new"
+    info "profiles for every stack: $new"
+    for n in "${stacks[@]}"; do
+      cmd_up "$n"
+    done
+  else
+    info "profiles are already $new everywhere; nothing to change"
   fi
+
+  # Compose leaves the containers of a dropped profile running. This looks at
+  # what exists rather than at what changed, so a re-run also clears what an
+  # interrupted run left behind.
+  for n in "${stacks[@]}"; do
+    stale=$(stale_services "$n")
+    [[ -n $stale ]] || continue
+    mapfile -t gone <<<"$stale"
+    info "$n: removing ${gone[*]} (their profile is off)"
+    compose "$n" rm -sf "${gone[@]}" || failed+=("$n")
+  done
+
+  if has_profile "$new" google; then
+    for n in "${stacks[@]}"; do
+      google_reminder "$n"
+    done
+  fi
+  ((${#failed[@]} == 0)) || die "could not remove the containers of dropped profiles in: ${failed[*]}; run the same command again"
 }
 
 cmd_upgrade() {

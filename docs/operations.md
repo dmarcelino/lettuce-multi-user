@@ -43,7 +43,7 @@ Optional features are compose profiles, the same list for **all** stacks (upstre
 ./lettucectl profiles                              # show config.env and every stack
 ./lettucectl profiles cloudflared,search,google    # set the list everywhere, then up all
 ```
-`profiles` writes `PROFILES` in `config.env` and `COMPOSE_PROFILES` in every `stack.env` together, removes the containers of profiles you dropped (Compose would leave them running), and runs `up all`. `codex` and `claude` change the app-server image, and `up` rebuilds it. The list must contain `cloudflared`.
+`profiles` first checks every stack, so one broken stack stops the change before anything is written. It then writes `PROFILES` in `config.env` and `COMPOSE_PROFILES` in every `stack.env` together, and runs `up` on every stack. It also removes the containers of profiles that are off, which Compose would leave running. That last step runs every time, so a re-run cleans up after an interrupted one. When the list is already set everywhere, it changes and restarts nothing. `codex` and `claude` change the app-server image, and `up` rebuilds it. The list must contain `cloudflared`.
 
 ## Config changes
 `config.env` values are copied into each `stack.env` when the stack is created. Use `profiles` for the profile list. To change `TZ` for existing stacks, edit `config.env` and every `stack.env`, then run `./lettucectl up all`.
