@@ -49,7 +49,7 @@ Nobody can reach another person's stack. **Cloudflare authenticates the people; 
    ```bash
    git clone <this repo> ~/lettuce && cd ~/lettuce
    ./lettucectl init                 # creates config.env from the example; edit it
-   $EDITOR config.env                # DOMAIN, PROFILES, TZ
+   $EDITOR config.env                # DOMAIN, PROFILES, TZ, PUSH_CONTACT_EMAIL
    ./lettucectl init                 # clones Lettuce, checks the token, caches Cloudflare ids
    ./lettucectl add alfred alfred@gmail.com
    ./lettucectl add hal hal@example.com

@@ -22,6 +22,7 @@ setup() {
   sed -e 's/^DOMAIN=.*/DOMAIN=example.org/' -e 's/^PROFILES=.*/PROFILES=cloudflared,search/' \
     -e 's/^CF_ACCOUNT_ID=.*/CF_ACCOUNT_ID=acc1/' -e 's/^CF_ZONE_ID=.*/CF_ZONE_ID=zone1/' \
     -e 's/^CF_TEAM_DOMAIN=.*/CF_TEAM_DOMAIN=team/' -e 's/^CF_GOOGLE_IDP_ID=.*/CF_GOOGLE_IDP_ID=idp-g/' \
+    -e 's/^PUSH_CONTACT_EMAIL=.*/PUSH_CONTACT_EMAIL=ops@example.org/' \
     "$ROOT/config.env.example" >"$H/config.env"
   chmod 600 "$H/config.env"
   echo '{"services":{"app-server":{"ports":[],"environment":{"DISABLE_AUTOUPDATER":"1"}},"bff":{}}}' >"$T/compose-config.json"
@@ -217,6 +218,11 @@ test_add_writes_private_stack_env() {
   local s
   s=$(senv alfred SESSION_SECRET)
   ((${#s} == 64)) || fail "SESSION_SECRET length ${#s}"
+  s=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
+  ((${#s} == 87)) || fail "PUSH_VAPID_PUBLIC_KEY length ${#s}"
+  s=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
+  ((${#s} == 43)) || fail "PUSH_VAPID_PRIVATE_KEY length ${#s}"
+  eq "$(senv alfred PUSH_VAPID_CONTACT_EMAIL)" ops@example.org
   ! grep -q '^DEV_BYPASS' "$H/stacks/alfred/stack.env" || fail "DEV_BYPASS in stack.env"
 }
 
@@ -225,6 +231,7 @@ test_add_secrets_differ_between_stacks() {
   ctl add hal hal@example.com
   ok_rc
   [[ $(senv alfred SESSION_SECRET) != "$(senv hal SESSION_SECRET)" ]] || fail "same SESSION_SECRET"
+  [[ $(senv alfred PUSH_VAPID_PRIVATE_KEY) != "$(senv hal PUSH_VAPID_PRIVATE_KEY)" ]] || fail "same VAPID key"
 }
 
 test_add_falls_back_when_name_resolves() {
@@ -339,6 +346,45 @@ test_up_refuses_auto_update_in_channel_gateway() {
   bad_rc
   out_has "channel-gateway"
   log_lacks "up -d"
+}
+
+test_up_adds_push_keys_to_existing_stack() {
+  added
+  sed -i '/^PUSH_VAPID_/d' "$H/stacks/alfred/stack.env"
+  ctl up alfred
+  ok_rc
+  [[ -n $(senv alfred PUSH_VAPID_PUBLIC_KEY) ]] || fail "no PUSH_VAPID_PUBLIC_KEY"
+  [[ -n $(senv alfred PUSH_VAPID_PRIVATE_KEY) ]] || fail "no PUSH_VAPID_PRIVATE_KEY"
+  eq "$(senv alfred PUSH_VAPID_CONTACT_EMAIL)" ops@example.org
+  log_has "up -d"
+}
+
+test_up_keeps_existing_push_keys() {
+  added
+  local pub priv
+  pub=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
+  priv=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
+  ctl up alfred
+  ok_rc
+  eq "$(senv alfred PUSH_VAPID_PUBLIC_KEY)" "$pub"
+  eq "$(senv alfred PUSH_VAPID_PRIVATE_KEY)" "$priv"
+}
+
+test_up_refuses_missing_push_contact() {
+  added
+  sed -i 's/^PUSH_CONTACT_EMAIL=.*/PUSH_CONTACT_EMAIL=/' "$H/config.env"
+  ctl up alfred
+  bad_rc
+  out_has "PUSH_CONTACT_EMAIL"
+  log_lacks "up -d"
+}
+
+test_check_refuses_missing_push_keys() {
+  added
+  sed -i '/^PUSH_VAPID_PRIVATE_KEY=/d' "$H/stacks/alfred/stack.env"
+  ctl check alfred
+  bad_rc
+  out_has "PUSH_VAPID_PRIVATE_KEY"
 }
 
 test_up_refuses_readable_stack_env() {
