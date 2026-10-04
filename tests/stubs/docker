@@ -11,7 +11,31 @@ printf 'docker-env PUBLIC_ORIGIN=%s\n' "${PUBLIC_ORIGIN:-}" >>"$STUB_LOG"
 args=" $* "
 case $args in
   *" compose version "*) echo "${STUB_COMPOSE_VERSION:-2.40.3}" ;;
+  *" ps -a --filter label=com.docker.compose.project="*)
+    # Containers come from $STUB_ROOT/containers.txt, lines of "<project> <service>".
+    project=${args#* label=com.docker.compose.project=}
+    project=${project%% *}
+    awk -v p="$project" '$1 == p { print $2 }' "$STUB_ROOT/containers.txt" 2>/dev/null
+    ;;
   *" config --format json "*) cat "$STUB_ROOT/compose-config.json" 2>/dev/null ;;
+  *" config --services "*)
+    # Like upstream: two services always, the rest per COMPOSE_PROFILES in --env-file.
+    env_file="" prev=""
+    for a in "$@"; do
+      [[ $prev == --env-file ]] && env_file=$a
+      prev=$a
+    done
+    printf '%s\n' app-server bff
+    IFS=, read -ra ps <<<"$(sed -n 's/^COMPOSE_PROFILES=//p' "$env_file")"
+    for p in "${ps[@]}"; do
+      case $p in
+        search) printf '%s\n' searxng ddg-mcp ;;
+        google) echo google-mcp ;;
+        telegram) echo channel-gateway ;;
+        cloudflared) echo cloudflared ;;
+      esac
+    done
+    ;;
   *" config "*) exit "${STUB_COMPOSE_CONFIG_RC:-0}" ;;
 esac
 exit 0

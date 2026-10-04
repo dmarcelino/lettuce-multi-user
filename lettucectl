@@ -21,6 +21,7 @@ Setup
   add <name> <email>[,<email>]  create a stack: hostname, Access policy + app, tunnel, DNS; start it
   users <name> <email>[,...]    replace who may sign in (Access policy and ALLOWED_USERS together)
   remove <name> [--purge]       stop a stack and delete its Cloudflare resources (--purge: its data too)
+  profiles [<p>,<p>...]         show, or set for every stack, the compose profiles (optional features)
   upgrade <tag>                 move upstream Lettuce to another tag and rebuild every stack
 
 Operation (<target> is a stack name or "all")
@@ -98,6 +99,13 @@ SESSION_SECRET=$(openssl rand -hex 32)
 CF_ACCESS_TEAM_DOMAIN=$(cfg CF_TEAM_DOMAIN)
 EOF
   )
+}
+
+# google_reminder NAME -> the step only the operator can do: Google has no API
+# for an OAuth client's redirect URIs.
+google_reminder() {
+  info "Google: add $(google_redirect_uri "$1") to your Google OAuth client's redirect URIs,"
+  info "  then connect in that stack's Settings -> Google (docs/google-setup.md)"
 }
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -195,6 +203,9 @@ cmd_add() {
   info ""
   info "'$name' is up: https://$host (sign in with Google as $emails)"
   info "First boot builds images and can take a few minutes; the hostname may need a minute to resolve."
+  if has_profile "$(cfg PROFILES)" google; then
+    google_reminder "$name"
+  fi
 }
 
 cmd_users() {
@@ -268,6 +279,9 @@ cmd_remove() {
     warn "not deleted (already gone, or delete it in the Cloudflare dashboard): ${left[*]}"
     warn "their ids stay in stacks/$name/stack.env, so 'lettucectl remove $name' can retry"
   fi
+  if has_profile "$(cfg PROFILES)" google; then
+    info "Google: delete $(google_redirect_uri "$name") from your Google OAuth client's redirect URIs"
+  fi
   if [[ -n $purge ]]; then
     if ((${#left[@]})); then
       warn "keeping stacks/$name because Cloudflare resources are left; purge again after they are gone"
@@ -284,6 +298,64 @@ cmd_remove() {
   else
     info "'$name' removed from Cloudflare; data kept in $(stack_dir "$name")"
   fi
+}
+
+cmd_profiles() {
+  (($# <= 1)) || die "usage: lettucectl profiles [<profile>,<profile>...]"
+  local new n changed="" stale
+  local -a stacks gone failed=()
+  mapfile -t stacks < <(list_stacks)
+  if (($# == 0)); then
+    require_config
+    printf '%-20s %s\n' config.env "$(cfg PROFILES)"
+    for n in "${stacks[@]}"; do
+      printf '%-20s %s\n' "$n" "$(env_get "$(stack_env "$n")" COMPOSE_PROFILES)"
+    done
+    return 0
+  fi
+  require_initialised
+  new=$(normalise_profiles "$1")
+  [[ $(cfg PROFILES) == "$new" ]] || changed=1
+  for n in "${stacks[@]}"; do
+    [[ $(env_get "$(stack_env "$n")" COMPOSE_PROFILES) == "$new" ]] || changed=1
+  done
+
+  if [[ -n $changed ]]; then
+    # Check every stack before writing anything, so one broken stack cannot
+    # leave the others half-switched.
+    for n in "${stacks[@]}"; do
+      ensure_push_keys "$n"
+      check_stack "$n" --skip-profiles
+    done
+    for n in "${stacks[@]}"; do
+      env_set "$(stack_env "$n")" COMPOSE_PROFILES "$new"
+    done
+    env_set "$(config_file)" PROFILES "$new"
+    info "profiles for every stack: $new"
+    for n in "${stacks[@]}"; do
+      cmd_up "$n"
+    done
+  else
+    info "profiles are already $new everywhere; nothing to change"
+  fi
+
+  # Compose leaves the containers of a dropped profile running. This looks at
+  # what exists rather than at what changed, so a re-run also clears what an
+  # interrupted run left behind.
+  for n in "${stacks[@]}"; do
+    stale=$(stale_services "$n")
+    [[ -n $stale ]] || continue
+    mapfile -t gone <<<"$stale"
+    info "$n: removing ${gone[*]} (their profile is off)"
+    compose "$n" rm -sf "${gone[@]}" || failed+=("$n")
+  done
+
+  if has_profile "$new" google; then
+    for n in "${stacks[@]}"; do
+      google_reminder "$n"
+    done
+  fi
+  ((${#failed[@]} == 0)) || die "could not remove the containers of dropped profiles in: ${failed[*]}; run the same command again"
 }
 
 cmd_upgrade() {
@@ -374,7 +446,7 @@ main() {
   local cmd=${1:-help}
   shift || true
   case $cmd in
-    init | add | users | remove | upgrade | up | down | restart | check | status | list | logs | compose)
+    init | add | users | remove | profiles | upgrade | up | down | restart | check | status | list | logs | compose)
       "cmd_$cmd" "$@"
       ;;
     help | -h | --help) usage ;;

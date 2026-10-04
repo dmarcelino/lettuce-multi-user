@@ -86,6 +86,31 @@ has_profile() {
   return 1
 }
 
+# normalise_profiles "cloudflared, search" -> "cloudflared,search" (dies on a bad
+# name, a duplicate, or a list without cloudflared)
+normalise_profiles() {
+  local IFS=, p out=()
+  for p in $1; do
+    p=$(printf '%s' "$p" | tr -d '[:space:]')
+    [[ -z $p ]] && continue
+    [[ $p =~ ^[a-z][a-z0-9_-]*$ ]] || die "invalid profile name '$p'"
+    if ((${#out[@]})) && has_profile "${out[*]}" "$p"; then
+      die "profile '$p' is listed twice"
+    fi
+    out+=("$p")
+  done
+  if ((${#out[@]} == 0)) || ! has_profile "${out[*]}" cloudflared; then
+    die "the profile list must contain cloudflared"
+  fi
+  printf '%s' "${out[*]}"
+}
+
+# google_redirect_uri NAME -> the OAuth redirect URI that stack's Settings -> Google
+# uses; upstream derives it from PUBLIC_ORIGIN.
+google_redirect_uri() {
+  printf '%s/api/google/oauth/callback' "$(env_get "$(stack_env "$1")" PUBLIC_ORIGIN)"
+}
+
 # ── validation ───────────────────────────────────────────────────────────────
 validate_name() {
   [[ $1 =~ ^[a-z][a-z0-9-]{0,19}$ && $1 != *- ]] ||
@@ -147,6 +172,17 @@ compose() {
     "$@"
 }
 
+# stale_services NAME -> services that have a container in the stack but are not
+# enabled by its profiles: Compose leaves those running when a profile is dropped.
+stale_services() {
+  local enabled existing
+  enabled=$(compose "$1" config --services) || die "$1: docker compose config failed"
+  existing=$(env -i PATH="$PATH" HOME="$HOME" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} \
+    docker ps -a --filter "label=com.docker.compose.project=lettuce-$1" \
+    --format '{{.Label "com.docker.compose.service"}}') || die "$1: docker ps failed"
+  comm -23 <(sort -u <<<"$existing") <(sort -u <<<"$enabled") | sed '/^$/d'
+}
+
 # ── push notifications ───────────────────────────────────────────────────────
 # vapid_keypair -> "<public> <private>", base64url as web-push expects: the
 # uncompressed P-256 point (65 bytes) and the private scalar (32 bytes). The PEM
@@ -180,9 +216,10 @@ ensure_push_keys() {
   fi
 }
 
-# check_stack NAME -> dies with the first reason the stack must not start.
+# check_stack NAME [--skip-profiles] -> dies with the first reason the stack must
+# not start. `profiles` skips the profile checks before it rewrites the lists.
 check_stack() {
-  local name=$1 f k profiles rendered published updating
+  local name=$1 skip_profiles=${2:-} f k profiles rendered published updating
   f=$(stack_env "$name")
   [[ -f $f ]] || die "$name: stack.env missing"
   [[ $(file_mode "$f") == 600 ]] || die "$name: stack.env must be mode 600"
@@ -196,10 +233,12 @@ check_stack() {
   done
   k=$(env_get "$f" SESSION_SECRET)
   ((${#k} >= 32)) || die "$name: SESSION_SECRET is shorter than 32 characters"
-  profiles=$(env_get "$f" COMPOSE_PROFILES)
-  has_profile "$profiles" cloudflared || die "$name: COMPOSE_PROFILES must contain cloudflared"
-  [[ $profiles == "$(cfg PROFILES)" ]] ||
-    die "$name: COMPOSE_PROFILES ($profiles) differs from config.env PROFILES ($(cfg PROFILES)); all stacks share one image"
+  if [[ $skip_profiles != --skip-profiles ]]; then
+    profiles=$(env_get "$f" COMPOSE_PROFILES)
+    has_profile "$profiles" cloudflared || die "$name: COMPOSE_PROFILES must contain cloudflared"
+    [[ $profiles == "$(cfg PROFILES)" ]] ||
+      die "$name: COMPOSE_PROFILES ($profiles) differs from config.env PROFILES ($(cfg PROFILES)); all stacks share one image (set both with: lettucectl profiles <list>)"
+  fi
   rendered=$(compose "$name" config --format json) || die "$name: docker compose config failed"
   published=$(jq '[.services[] | (.ports // []) | length] | add // 0' <<<"$rendered")
   [[ $published == 0 ]] || die "$name: $published published port(s) in the rendered config; nothing may be published"
