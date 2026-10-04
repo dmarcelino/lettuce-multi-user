@@ -108,6 +108,16 @@ google_reminder() {
   info "  then connect in that stack's Settings -> Google (docs/google-setup.md)"
 }
 
+# route_stack NAME -> re-applies the stack's tunnel routes for its current
+# profiles; a stack whose setup never got a tunnel is skipped
+route_stack() {
+  local f tun
+  f=$(stack_env "$1")
+  tun=$(env_get "$f" CF_TUNNEL_ID)
+  [[ -n $tun && -n $(env_get "$f" CF_DNS_RECORD_ID) ]] || return 0
+  cf_tunnel_configure "$(cfg CF_ACCOUNT_ID)" "$tun" "$(env_get "$f" LETTUCE_HOSTNAME)" "$(env_get "$f" COMPOSE_PROFILES)"
+}
+
 # ── commands ─────────────────────────────────────────────────────────────────
 cmd_init() {
   local c v f ref cur zone team idp
@@ -195,7 +205,7 @@ cmd_add() {
     id=$(cf_tunnel_token "$acc" "$(env_get "$f" CF_TUNNEL_ID)") || die "$hint"
     env_set "$f" CLOUDFLARE_TUNNEL_TOKEN "$id"
   fi
-  cf_tunnel_configure "$acc" "$(env_get "$f" CF_TUNNEL_ID)" "$host" || die "$hint"
+  cf_tunnel_configure "$acc" "$(env_get "$f" CF_TUNNEL_ID)" "$host" "$(env_get "$f" COMPOSE_PROFILES)" || die "$hint"
   id=$(cf_dns_cname_create "$(cfg CF_ZONE_ID)" "$host" "$(env_get "$f" CF_TUNNEL_ID)" "lettucectl stack $name") || die "$hint"
   env_set "$f" CF_DNS_RECORD_ID "$id"
 
@@ -236,6 +246,9 @@ cmd_remove() {
   zone=$(cfg CF_ZONE_ID)
 
   info "This stops '$name' and deletes its DNS record, tunnel and Access application."
+  if has_profile "$(env_get "$f" COMPOSE_PROFILES)" secrets; then
+    info "Its vault (the people's saved personal data) is deleted too: its volume goes with the stack."
+  fi
   if [[ -n $purge ]]; then
     info "--purge also deletes ALL of its data (agents, memory, conversations): $(stack_dir "$name")"
   else
@@ -303,7 +316,7 @@ cmd_remove() {
 cmd_profiles() {
   (($# <= 1)) || die "usage: lettucectl profiles [<profile>,<profile>...]"
   local new n changed="" stale
-  local -a stacks gone failed=()
+  local -a stacks gone failed=() unrouted=()
   mapfile -t stacks < <(list_stacks)
   if (($# == 0)); then
     require_config
@@ -332,6 +345,15 @@ cmd_profiles() {
     done
     env_set "$(config_file)" PROFILES "$new"
     info "profiles for every stack: $new"
+  fi
+
+  # The tunnel routes /secrets/ only with the `secrets` profile. Applied on
+  # every run, before the stacks start, so a re-run repairs a failed update.
+  for n in "${stacks[@]}"; do
+    route_stack "$n" || unrouted+=("$n")
+  done
+
+  if [[ -n $changed ]]; then
     for n in "${stacks[@]}"; do
       cmd_up "$n"
     done
@@ -355,7 +377,9 @@ cmd_profiles() {
       google_reminder "$n"
     done
   fi
-  ((${#failed[@]} == 0)) || die "could not remove the containers of dropped profiles in: ${failed[*]}; run the same command again"
+  ((${#unrouted[@]} == 0)) || warn "could not update the tunnel routes of: ${unrouted[*]}"
+  ((${#failed[@]} == 0)) || warn "could not remove the containers of dropped profiles in: ${failed[*]}"
+  ((${#unrouted[@]} + ${#failed[@]} == 0)) || die "run the same command again"
 }
 
 cmd_upgrade() {

@@ -168,6 +168,7 @@ compose() {
     -f "$up/docker/compose.yml" \
     -f "$LETTUCE_HOME/compose/hardening.yml" \
     -f "$LETTUCE_HOME/compose/multi.yml" \
+    -f "$LETTUCE_HOME/compose/secrets.yml" \
     --env-file "$(stack_env "$name")" \
     "$@"
 }
@@ -198,22 +199,25 @@ vapid_keypair() {
 
 base64url() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
 
-# ensure_push_keys NAME -> gives the stack a VAPID keypair once and keeps it:
-# a new keypair would invalidate every browser subscription. The contact address
-# follows config.env.
+# ensure_push_keys NAME -> gives the stack its VAPID keypairs once and keeps
+# them: a new keypair would invalidate every browser subscription. The BFF and
+# the vault (secret-broker) each get their own, so neither holds the other's private
+# key. The contact address follows config.env.
 ensure_push_keys() {
-  local f contact pair
+  local f contact pair prefix
   f=$(stack_env "$1")
   contact=$(cfg PUSH_CONTACT_EMAIL)
   [[ -n $contact ]] || die "PUSH_CONTACT_EMAIL is empty in config.env; set it to the operator's email address"
   contact=$(normalise_emails "$contact")
   [[ $contact != *,* ]] || die "PUSH_CONTACT_EMAIL in config.env must be a single address"
   [[ $(env_get "$f" PUSH_VAPID_CONTACT_EMAIL) == "$contact" ]] || env_set "$f" PUSH_VAPID_CONTACT_EMAIL "$contact"
-  if [[ -z $(env_get "$f" PUSH_VAPID_PUBLIC_KEY) || -z $(env_get "$f" PUSH_VAPID_PRIVATE_KEY) ]]; then
-    pair=$(vapid_keypair)
-    env_set "$f" PUSH_VAPID_PUBLIC_KEY "${pair% *}"
-    env_set "$f" PUSH_VAPID_PRIVATE_KEY "${pair#* }"
-  fi
+  for prefix in PUSH BROKER; do
+    if [[ -z $(env_get "$f" "${prefix}_VAPID_PUBLIC_KEY") || -z $(env_get "$f" "${prefix}_VAPID_PRIVATE_KEY") ]]; then
+      pair=$(vapid_keypair)
+      env_set "$f" "${prefix}_VAPID_PUBLIC_KEY" "${pair% *}"
+      env_set "$f" "${prefix}_VAPID_PRIVATE_KEY" "${pair#* }"
+    fi
+  done
 }
 
 # check_stack NAME [--skip-profiles] -> dies with the first reason the stack must
@@ -228,7 +232,8 @@ check_stack() {
   fi
   for k in SESSION_SECRET LETTA_STATE_DIR PUBLIC_ORIGIN ALLOWED_USERS COMPOSE_PROFILES \
     CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD CLOUDFLARE_TUNNEL_TOKEN \
-    PUSH_VAPID_PUBLIC_KEY PUSH_VAPID_PRIVATE_KEY PUSH_VAPID_CONTACT_EMAIL; do
+    PUSH_VAPID_PUBLIC_KEY PUSH_VAPID_PRIVATE_KEY PUSH_VAPID_CONTACT_EMAIL \
+    BROKER_VAPID_PUBLIC_KEY BROKER_VAPID_PRIVATE_KEY; do
     [[ -n $(env_get "$f" "$k") ]] || die "$name: $k is empty"
   done
   k=$(env_get "$f" SESSION_SECRET)
@@ -247,4 +252,23 @@ check_stack() {
     | select(.value.environment.DISABLE_AUTOUPDATER != "1") | .key] | join(", ")' <<<"$rendered")
   [[ -z $updating ]] ||
     die "$name: DISABLE_AUTOUPDATER is not 1 for $updating; letta-code would reinstall itself over the pinned version (compose/hardening.yml)"
+  if has_profile "$(env_get "$f" COMPOSE_PROFILES)" secrets; then
+    check_broker "$name" "$rendered"
+  fi
+}
+
+# check_broker NAME RENDERED -> the vault service keeps the isolation
+# compose/secrets.yml gives it: its volume is its alone, its root filesystem is
+# read-only, it has no capabilities and no host paths.
+check_broker() {
+  local name=$1 rendered=$2 broker others
+  broker=$(jq -c '.services["secret-broker"] // empty' <<<"$2")
+  [[ -n $broker ]] || die "$name: the secrets profile is on but secret-broker is not in the rendered config (compose/secrets.yml)"
+  jq -e '.read_only == true' <<<"$broker" >/dev/null || die "$name: secret-broker must have read_only: true"
+  jq -e '(.cap_drop // []) | index("ALL")' <<<"$broker" >/dev/null || die "$name: secret-broker must drop all capabilities (cap_drop: [ALL])"
+  jq -e '[(.volumes // [])[] | select(.type != "volume" and .type != "tmpfs")] | length == 0' <<<"$broker" >/dev/null ||
+    die "$name: secret-broker must not mount host paths"
+  others=$(jq -r '[.services | to_entries[] | select(.key != "secret-broker")
+    | select([(.value.volumes // [])[] | select(.source == "secret-broker-data")] | length > 0) | .key] | join(", ")' <<<"$rendered")
+  [[ -z $others ]] || die "$name: $others mount(s) the vault's volume; only secret-broker may"
 }

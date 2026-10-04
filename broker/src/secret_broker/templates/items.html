@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Items{% endblock %}
+{% block content %}
+<h1>Items</h1>
+<p><a class="button" href="/secrets/items/new">Add an item</a></p>
+{% for item, pv in items %}
+<a class="card item-link" href="/secrets/items/{{ item.id }}">
+  <strong>{{ item.name }}</strong>
+  <span class="muted">{{ item.kind_label }}{% if pv %} - {{ pv }}{% endif %}</span>
+  {% if item.share_mode == "auto" %}<span class="tag">shared without asking</span>{% endif %}
+</a>
+{% else %}
+<p class="muted">Your vault is empty. Add your address, a card, your passport, a frequent-flyer number...</p>
+{% endfor %}
+{% endblock %}

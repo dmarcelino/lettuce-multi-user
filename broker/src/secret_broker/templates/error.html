@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Error{% endblock %}
+{% block content %}
+<h1>Not done</h1>
+<p class="card warn">{{ message }}</p>
+{% if email %}<p><a href="/secrets/">Requests</a> - <a href="/secrets/items">Items</a></p>{% endif %}
+{% endblock %}

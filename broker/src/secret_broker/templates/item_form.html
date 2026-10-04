@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ "Edit " + item.name if item else "New " + kind.label }}{% endblock %}
+{% block content %}
+<h1>{{ "Edit " + item.name if item else "New " + kind.label|lower }}</h1>
+<form method="post" action="{{ '/secrets/items/' + item.id if item else '/secrets/items' }}" class="card" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="kind" value="{{ kind.key }}">
+  <label>Name <small>(how you and your agents will recognise it, e.g. "Home address", "Work Visa")</small>
+    <input name="name" required maxlength="80" value="{{ item.name if item else '' }}">
+  </label>
+
+  {% for spec in kind.fields %}
+  {% set current = item.field(spec.key) if item else None %}
+  <label>{{ spec.label }}{% if spec.sensitive %} <span class="tag">private</span>{% endif %}{% if spec.hint %} <small>({{ spec.hint }})</small>{% endif %}
+    {% if spec.multiline %}
+    <textarea name="f_{{ spec.key }}" rows="3"{% if spec.sensitive and current %} placeholder="Unchanged - type to replace"{% endif %}>{% if current and not spec.sensitive %}{{ current.value }}{% endif %}</textarea>
+    {% else %}
+    <input name="f_{{ spec.key }}" {% if spec.sensitive %}type="password" autocomplete="new-password"{% if current %} placeholder="Unchanged - type to replace"{% endif %}{% else %}value="{{ current.value if current else '' }}"{% endif %}>
+    {% endif %}
+  </label>
+  {% if spec.sensitive and current %}<label class="inline small"><input type="checkbox" name="clear_{{ spec.key }}"> Remove this value</label>{% endif %}
+  {% endfor %}
+
+  <fieldset>
+    <legend>Other fields</legend>
+    {% for f in custom %}
+    {% set i = loop.index0 %}
+    <div class="custom">
+      <input type="hidden" name="c_key_{{ i }}" value="{{ f.key }}">
+      <input name="c_label_{{ i }}" value="{{ f.label }}" placeholder="Label">
+      <input name="c_value_{{ i }}" {% if f.sensitive %}type="password" placeholder="Unchanged - type to replace"{% else %}value="{{ f.value }}"{% endif %}>
+      <label class="inline small"><input type="checkbox" name="c_sensitive_{{ i }}" {% if f.sensitive %}checked{% endif %}> private</label>
+      <label class="inline small"><input type="checkbox" name="c_remove_{{ i }}"> remove</label>
+    </div>
+    {% endfor %}
+    {% for n in range(blank_rows) %}
+    {% set i = custom|length + n %}
+    <div class="custom">
+      <input name="c_label_{{ i }}" placeholder="Label, e.g. Seat preference">
+      <input name="c_value_{{ i }}" placeholder="Value">
+      <label class="inline small"><input type="checkbox" name="c_sensitive_{{ i }}"> private</label>
+    </div>
+    {% endfor %}
+    <p class="muted small">Private fields are hidden on screen until you press Show.</p>
+  </fieldset>
+
+  <label>What agents may use it for <small>(optional; agents see this)</small>
+    <input name="usage" maxlength="200" value="{{ item.usage if item else '' }}" placeholder="e.g. online shopping deliveries">
+  </label>
+
+  <fieldset>
+    <legend>When an agent wants to use it</legend>
+    <label class="inline"><input type="radio" name="share_mode" value="ask" {% if not item or item.share_mode == "ask" %}checked{% endif %}> Ask me every time</label>
+    {% if kind.auto_allowed %}
+    <label class="inline"><input type="radio" name="share_mode" value="auto" {% if item and item.share_mode == "auto" %}checked{% endif %}> Agents may use it without asking</label>
+    <p class="muted small">You still get a notification each time, and it shows in History. Not available when the item has private fields.</p>
+    {% else %}
+    <p class="muted small">{{ kind.label }} items always ask.</p>
+    {% endif %}
+  </fieldset>
+  <button>Save</button>
+</form>
+<p><a href="{{ '/secrets/items/' + item.id if item else '/secrets/items' }}">Cancel</a></p>
+{% endblock %}

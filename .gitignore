@@ -3,3 +3,8 @@
 /config.env
 /.secrets/
 /stacks/
+
+# Build and test output of broker/
+__pycache__/
+*.egg-info/
+.pytest_cache/

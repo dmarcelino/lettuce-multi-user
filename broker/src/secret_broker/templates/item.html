@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ item.name }}{% endblock %}
+{% block content %}
+<h1>{{ item.name }}</h1>
+<p class="muted">{{ item.kind_label }}{% if preview %} - {{ preview }}{% endif %}</p>
+<section class="card">
+  <dl class="fields">
+    {% for f in item.fields %}
+    <dt>{{ f.label }}{% if f.sensitive %} <span class="tag">private</span>{% endif %}</dt>
+    <dd>
+      {% if f.sensitive and not revealed %}<span class="muted">&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;</span>
+      {% else %}<span class="value" id="v-{{ loop.index }}">{{ f.value }}</span>
+        <button type="button" class="secondary small" data-copy="v-{{ loop.index }}">Copy</button>{% endif %}
+    </dd>
+    {% endfor %}
+  </dl>
+  {% if not revealed and item.fields|selectattr("sensitive")|list %}
+  <form method="post" action="/secrets/items/{{ item.id }}/show">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="secondary">Show private fields</button>
+  </form>
+  {% endif %}
+</section>
+<section class="card">
+  <p><strong>Agents:</strong> {{ "may use this without asking you" if item.share_mode == "auto" else "must ask you every time" }}.</p>
+  {% if item.usage %}<p><strong>Use it for:</strong> {{ item.usage }}</p>{% endif %}
+</section>
+<p><a class="button" href="/secrets/items/{{ item.id }}/edit">Edit</a></p>
+<form method="post" action="/secrets/items/{{ item.id }}/delete" class="card danger" data-confirm="Delete {{ item.name }}? This cannot be undone.">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <button class="deny">Delete this item</button>
+</form>
+<p><a href="/secrets/items">All items</a></p>
+{% endblock %}

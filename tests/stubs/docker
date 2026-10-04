@@ -33,6 +33,7 @@ case $args in
         google) echo google-mcp ;;
         telegram) echo channel-gateway ;;
         cloudflared) echo cloudflared ;;
+        secrets) echo secret-broker ;;
       esac
     done
     ;;

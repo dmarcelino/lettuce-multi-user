@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Requests{% endblock %}
+{% block content %}
+<h1>Requests</h1>
+{% for req in pending %}
+<section class="card pending">
+  {% include "_decide.html" %}
+</section>
+{% else %}
+<p class="muted">Nothing is waiting. When an agent asks for something from your vault, it appears here and on your devices.</p>
+{% endfor %}
+
+{% if recent %}
+<h2>Answered recently</h2>
+<ul class="list">
+  {% for req in recent %}
+  <li>
+    <span class="status {{ req.status }}">{{ {"done": "shared", "denied": "denied", "expired": "expired"}[req.status] }}</span>
+    {{ req.item_name }}{% if req.shared %}: {% for k in req.shared %}{{ req.labels[k] }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
+    <span class="muted small">{{ (req.decided_at or req.created_at)|time }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

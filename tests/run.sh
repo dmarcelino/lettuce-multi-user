@@ -57,6 +57,14 @@ log_has() { grep -qF -- "$1" "$T/calls.log" || fail "call log lacks: $1"; }
 log_lacks() { ! grep -qF -- "$1" "$T/calls.log" || fail "call log unexpectedly has: $1"; }
 eq() { [[ $1 == "$2" ]] || fail "expected [$2], got [$1]"; }
 
+# broker_config [BROKER_JSON] -> the rendered compose config also holds this
+# secret-broker (default: the hardened one compose/secrets.yml renders)
+broker_config() {
+  local broker=${1:-'{"read_only":true,"cap_drop":["ALL"],"volumes":[{"type":"volume","source":"secret-broker-data","target":"/data"}]}'}
+  jq -c --argjson b "$broker" '.services["secret-broker"] = $b' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+}
+
 run_test() {
   local name=$1
   [[ -z $FILTER || $name == *"$FILTER"* ]] || return 0
@@ -224,6 +232,11 @@ test_add_writes_private_stack_env() {
   s=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
   ((${#s} == 43)) || fail "PUSH_VAPID_PRIVATE_KEY length ${#s}"
   eq "$(senv alfred PUSH_VAPID_CONTACT_EMAIL)" ops@example.org
+  s=$(senv alfred BROKER_VAPID_PUBLIC_KEY)
+  ((${#s} == 87)) || fail "BROKER_VAPID_PUBLIC_KEY length ${#s}"
+  s=$(senv alfred BROKER_VAPID_PRIVATE_KEY)
+  ((${#s} == 43)) || fail "BROKER_VAPID_PRIVATE_KEY length ${#s}"
+  [[ $(senv alfred BROKER_VAPID_PRIVATE_KEY) != "$(senv alfred PUSH_VAPID_PRIVATE_KEY)" ]] || fail "broker shares the BFF's VAPID key"
   ! grep -q '^DEV_BYPASS' "$H/stacks/alfred/stack.env" || fail "DEV_BYPASS in stack.env"
 }
 
@@ -233,6 +246,15 @@ test_add_secrets_differ_between_stacks() {
   ok_rc
   [[ $(senv alfred SESSION_SECRET) != "$(senv hal SESSION_SECRET)" ]] || fail "same SESSION_SECRET"
   [[ $(senv alfred PUSH_VAPID_PRIVATE_KEY) != "$(senv hal PUSH_VAPID_PRIVATE_KEY)" ]] || fail "same VAPID key"
+}
+
+test_add_routes_the_secrets_path_with_the_profile() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  ctl add alfred alfred@example.com
+  ok_rc
+  eq "$(jq -c '.config.ingress' <<<"$(body_of PUT /accounts/acc1/cfd_tunnel/tun1/configurations)")" \
+    '[{"hostname":"alfred.example.org","path":"^/secrets(/|$)","service":"http://secret-broker:8000"},{"hostname":"alfred.example.org","service":"http://app-server:8080"},{"service":"http_status:404"}]'
 }
 
 test_add_falls_back_when_name_resolves() {
@@ -373,15 +395,27 @@ test_up_adds_push_keys_to_existing_stack() {
   log_has "up -d"
 }
 
+test_up_adds_broker_push_keys_to_existing_stack() {
+  added
+  local pub
+  pub=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
+  sed -i '/^BROKER_VAPID_/d' "$H/stacks/alfred/stack.env"
+  ctl up alfred
+  ok_rc
+  [[ -n $(senv alfred BROKER_VAPID_PUBLIC_KEY) ]] || fail "no BROKER_VAPID_PUBLIC_KEY"
+  [[ -n $(senv alfred BROKER_VAPID_PRIVATE_KEY) ]] || fail "no BROKER_VAPID_PRIVATE_KEY"
+  eq "$(senv alfred PUSH_VAPID_PUBLIC_KEY)" "$pub"
+}
+
 test_up_keeps_existing_push_keys() {
   added
   local pub priv
   pub=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
-  priv=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
+  priv=$(senv alfred BROKER_VAPID_PRIVATE_KEY)
   ctl up alfred
   ok_rc
   eq "$(senv alfred PUSH_VAPID_PUBLIC_KEY)" "$pub"
-  eq "$(senv alfred PUSH_VAPID_PRIVATE_KEY)" "$priv"
+  eq "$(senv alfred BROKER_VAPID_PRIVATE_KEY)" "$priv"
 }
 
 test_up_refuses_missing_push_contact() {
@@ -401,6 +435,64 @@ test_check_refuses_missing_push_keys() {
   out_has "PUSH_VAPID_PRIVATE_KEY"
 }
 
+# with_secrets [BROKER_JSON] -> alfred runs the `secrets` profile and the
+# rendered config holds this secret-broker (default: the hardened one)
+with_secrets() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=cloudflared,secrets/' "$H/stacks/alfred/stack.env"
+  broker_config "$@"
+}
+
+test_check_accepts_the_hardened_broker() {
+  added
+  with_secrets
+  ctl check alfred
+  ok_rc
+}
+
+test_check_refuses_missing_broker_keys() {
+  added
+  sed -i '/^BROKER_VAPID_PRIVATE_KEY=/d' "$H/stacks/alfred/stack.env"
+  ctl check alfred
+  bad_rc
+  out_has "BROKER_VAPID_PRIVATE_KEY"
+}
+
+test_check_refuses_a_broker_that_is_not_hardened() {
+  added
+  local b
+  for b in \
+    '{"cap_drop":["ALL"],"volumes":[]}' \
+    '{"read_only":true,"volumes":[]}' \
+    '{"read_only":true,"cap_drop":["NET_RAW"],"volumes":[]}' \
+    '{"read_only":true,"cap_drop":["ALL"],"volumes":[{"type":"bind","source":"/srv","target":"/data"}]}'; do
+    with_secrets "$b"
+    ctl check alfred
+    bad_rc
+    out_has "secret-broker"
+  done
+}
+
+test_check_refuses_another_service_on_the_broker_volume() {
+  added
+  with_secrets
+  jq -c '.services.bff.volumes = [{"type":"volume","source":"secret-broker-data","target":"/x"}]' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+  ctl check alfred
+  bad_rc
+  out_has "bff"
+}
+
+test_check_refuses_secrets_profile_without_the_broker() {
+  added
+  with_secrets
+  jq -c 'del(.services["secret-broker"])' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+  ctl check alfred
+  bad_rc
+  out_has "secret-broker"
+}
+
 test_up_refuses_readable_stack_env() {
   added
   chmod 644 "$H/stacks/alfred/stack.env"
@@ -414,7 +506,7 @@ test_compose_ignores_the_callers_environment() {
   PUBLIC_ORIGIN=https://evil.example ctl up alfred
   ok_rc
   log_lacks "PUBLIC_ORIGIN=https://evil.example"
-  log_has "--project-directory $H/upstream/docker -f $H/upstream/docker/compose.yml -f $H/compose/hardening.yml -f $H/compose/multi.yml --env-file $H/stacks/alfred/stack.env"
+  log_has "--project-directory $H/upstream/docker -f $H/upstream/docker/compose.yml -f $H/compose/hardening.yml -f $H/compose/multi.yml -f $H/compose/secrets.yml --env-file $H/stacks/alfred/stack.env"
 }
 
 test_up_all_starts_every_stack() {
@@ -481,6 +573,15 @@ test_remove_reminds_to_delete_the_google_redirect_uri() {
   ctl remove alfred --purge <<<"alfred"
   ok_rc
   out_has "delete https://alfred.example.org/api/google/oauth/callback"
+}
+
+test_remove_says_the_vault_goes_too() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  added
+  ctl remove alfred <<<"alfred"
+  ok_rc
+  out_has "Its vault"
 }
 
 # ── profiles ─────────────────────────────────────────────────────────────────
@@ -568,6 +669,40 @@ test_profiles_repairs_drift() {
   ok_rc
   eq "$(senv alfred COMPOSE_PROFILES)" cloudflared,search
   log_has "up -d --build"
+}
+
+test_profiles_routes_secrets_for_every_stack() {
+  broker_config
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  : >"$T/calls.log"
+  ctl profiles cloudflared,search,secrets
+  ok_rc
+  eq "$(grep -c '^curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations ' "$T/calls.log")" 2
+  grep '^curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations ' "$T/calls.log" | grep -qF '"hostname":"hal.example.org","path":"^/secrets(/|$)"' ||
+    fail "hal has no /secrets route"
+  # The route is in place before the stacks start.
+  [[ $(grep -n '^curl PUT' "$T/calls.log" | tail -1 | cut -d: -f1) -lt $(grep -n 'up -d --build' "$T/calls.log" | head -1 | cut -d: -f1) ]] ||
+    fail "stacks started before their route"
+}
+
+test_profiles_dropping_secrets_removes_the_route() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  added
+  ctl profiles cloudflared
+  ok_rc
+  log_has "curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations"
+  log_lacks "secret-broker"
+}
+
+test_profiles_reports_a_failed_route_update() {
+  broker_config
+  added
+  stub 'STUB_CF_FAIL="PUT /accounts/acc1/cfd_tunnel/tun1/configurations"'
+  ctl profiles cloudflared,search,secrets
+  bad_rc
+  out_has "run the same command again"
 }
 
 test_profiles_refuses_a_bad_list() {

@@ -1,0 +1,17 @@
+{# The question the user answers: which fields of which item, and why. #}
+<form method="post" action="/secrets/r/{{ req.id }}/decide" class="decide">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <p><strong>{{ req.item_name }}</strong> <span class="muted">{{ req.item_kind }}{% if req.preview %} - {{ req.preview }}{% endif %}</span></p>
+  <p>An agent wants these details:</p>
+  <fieldset>
+    {% for key in req.fields %}
+    <label class="inline"><input type="checkbox" name="fields" value="{{ key }}" checked> {{ req.labels[key] }}{% if key in req.sensitive %} <span class="tag">private</span>{% endif %}</label>
+    {% endfor %}
+  </fieldset>
+  <p>It says it needs them to:</p>
+  <blockquote>{{ req.purpose }}</blockquote>
+  <p class="muted small">What you share is given to the agent and stays in that conversation, which the AI provider also sees.</p>
+  <button name="action" value="share">Share once</button>
+  <button name="action" value="deny" class="deny">Deny</button>
+  <span class="muted small">expires {{ req.expires_at|time }}</span>
+</form>

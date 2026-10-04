@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Add an item{% endblock %}
+{% block content %}
+<h1>What would you like to add?</h1>
+<div class="kinds">
+  {% for key, kind in kinds.items() %}
+  <a class="card item-link" href="/secrets/items/new?kind={{ key }}"><strong>{{ kind.label }}</strong>
+    <span class="muted small">{{ kind.fields|map(attribute="label")|join(", ") }}</span></a>
+  {% endfor %}
+</div>
+{% endblock %}
