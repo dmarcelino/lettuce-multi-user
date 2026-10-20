@@ -9,6 +9,11 @@ from dataclasses import dataclass
 REQUEST_TTL_SECONDS = 600
 # Shared values wait this long for the agent to fetch them (once).
 RESULT_TTL_SECONDS = 1800
+# A handle for "env" delivery can be redeemed (once) this long after it is issued.
+HANDLE_TTL_SECONDS = 300
+# More unused handles than this are refused, as MAX_PENDING does for requests:
+# secrets shared without asking would otherwise mint them without limit.
+MAX_HANDLES = 10
 # More waiting requests than this are refused, which also caps push spam.
 MAX_PENDING = 5
 # Longest `get_result(wait_seconds=...)`; Lettuce's MCP bridge gives a tool

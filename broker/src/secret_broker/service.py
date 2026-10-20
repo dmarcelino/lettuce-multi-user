@@ -3,8 +3,10 @@
 An agent lists secrets (names, types and public fields; never private values),
 asks for the private fields of one secret with a purpose, and gets them once
 the user has approved, or straight away for secrets the user set to "share
-without asking". Requests and results live only in memory: a restart locks the
-vault anyway.
+without asking". With "env" delivery the agent gets a single-use handle instead
+of the values, and `vault-run` (agent-skills/using-vault-secrets) redeems it to
+pass them to one command. Requests, results and handles live only in memory: a
+restart locks the vault anyway.
 """
 
 from __future__ import annotations
@@ -16,7 +18,15 @@ from typing import Any
 
 import anyio
 
-from .config import MAX_PENDING, MAX_PURPOSE_LENGTH, MAX_WAIT_SECONDS, REQUEST_TTL_SECONDS, RESULT_TTL_SECONDS
+from .config import (
+    HANDLE_TTL_SECONDS,
+    MAX_HANDLES,
+    MAX_PENDING,
+    MAX_PURPOSE_LENGTH,
+    MAX_WAIT_SECONDS,
+    REQUEST_TTL_SECONDS,
+    RESULT_TTL_SECONDS,
+)
 from .kinds import preview
 from .logs import SECRET_FILTER
 from .push import Pusher
@@ -25,6 +35,8 @@ from .vault import AUTO, Locked, Secret, Vault, VaultError
 log = logging.getLogger("secret_broker")
 
 PENDING, DONE, DENIED, EXPIRED = "pending", "done", "denied", "expired"
+TEXT, ENV = "text", "env"
+VAULT_RUN = "python3 /root/.letta/skills/using-vault-secrets/vault-run"
 # Pushes asking to unlock are sent at most this often.
 UNLOCK_NOTICE_SECONDS = 300
 
@@ -42,11 +54,28 @@ class Request:
     preview: str
     created_at: int
     expires_at: int
+    delivery: str = TEXT
     status: str = PENDING
     decided_by: str | None = None
     decided_at: int | None = None
     shared: tuple[str, ...] = ()
     values: dict[str, str] | None = field(default=None, repr=False)
+    lost_to_lock: bool = False  # approved, but the vault locked before the agent collected
+
+
+@dataclass
+class Handle:
+    id: str = field(repr=False)
+    secret_id: str
+    secret_name: str
+    labels: str
+    purpose: str
+    expires_at: int
+    env: dict[str, str] = field(repr=False)  # VAULT_<FIELD> -> value
+
+
+def env_name(key: str) -> str:
+    return f"VAULT_{key.upper()}"
 
 
 class Broker:
@@ -55,6 +84,7 @@ class Broker:
         self.pusher = pusher
         self._origin = public_origin
         self._requests: dict[str, Request] = {}
+        self._handles: dict[str, Handle] = {}
         self._tasks: anyio.abc.TaskGroup | None = None
         self._last_unlock_notice = -UNLOCK_NOTICE_SECONDS
 
@@ -96,11 +126,20 @@ class Broker:
     # ── housekeeping ─────────────────────────────────────────────────────────
     def expire(self) -> None:
         now = self.vault.now()
+        if not self.vault.is_unlocked():
+            # Values the agent has not collected are not kept past a lock.
+            self._handles.clear()
+            for req in self._requests.values():
+                if req.values is not None:
+                    req.values, req.lost_to_lock = None, True
         for rid, req in list(self._requests.items()):
             if req.status == PENDING and req.expires_at <= now:
                 req.status = EXPIRED
             if req.status != PENDING and (req.decided_at or req.created_at) + RESULT_TTL_SECONDS <= now:
                 del self._requests[rid]
+        for hid, handle in list(self._handles.items()):
+            if handle.expires_at <= now:
+                del self._handles[hid]
 
     def pending(self) -> list[Request]:
         self.expire()
@@ -140,11 +179,61 @@ class Broker:
     def _values(secret: Secret, keys: tuple[str, ...]) -> dict[str, str]:
         return {k: f.value for k in keys if (f := secret.field(k)) is not None}
 
-    async def request_secret(self, secret_id: str, purpose: str, fields: list[str] | None = None) -> dict[str, Any]:
+    def _deliver(
+        self,
+        secret_id: str,
+        secret_name: str,
+        labels: dict[str, str],
+        values: dict[str, str],
+        delivery: str,
+        purpose: str,
+    ) -> dict[str, Any]:
+        """The values themselves, or for "env" a handle that vault-run redeems."""
+        if delivery == TEXT:
+            return {"secret": secret_name, "values": values}
+        handle = Handle(
+            id=token_urlsafe(32),
+            secret_id=secret_id,
+            secret_name=secret_name,
+            labels=", ".join(labels[k] for k in values),
+            purpose=purpose,
+            expires_at=self.vault.now() + HANDLE_TTL_SECONDS,
+            env={env_name(k): v for k, v in values.items()},
+        )
+        self._handles[handle.id] = handle
+        return {
+            "secret": secret_name,
+            "handle": handle.id,
+            "env": {env_name(k): labels[k] for k in values},
+            "expires_in": HANDLE_TTL_SECONDS,
+            "run": f"{VAULT_RUN} {handle.id} -- <command>",
+        }
+
+    def redeem(self, handle_id: str) -> dict[str, Any] | None:
+        """Called by vault-run through /redeem: the values of a handle, once, while unlocked."""
+        self.expire()
+        handle = self._handles.pop(handle_id, None) if isinstance(handle_id, str) else None
+        if handle is None:
+            return None
+        detail = f"{handle.secret_name}: {handle.labels}. Purpose: {handle.purpose}"
+        with SECRET_FILTER.guarding(handle.env.values()):
+            self.vault.audit("agent", "given to a command", handle.secret_id, detail)
+            log.info("redeemed secret=%s fields=%s", handle.secret_id, ",".join(handle.env))
+        return {"secret": handle.secret_name, "env": handle.env}
+
+    async def request_secret(
+        self, secret_id: str, purpose: str, fields: list[str] | None = None, delivery: str = TEXT
+    ) -> dict[str, Any]:
         if not isinstance(secret_id, str) or not isinstance(purpose, str):
             return {"status": "refused", "error": "secret_id and purpose must be strings"}
         if fields is not None and not isinstance(fields, list):
             return {"status": "refused", "error": "fields must be a list of private field keys"}
+        if delivery not in (TEXT, ENV):
+            return {"status": "refused", "error": f"delivery must be '{TEXT}' or '{ENV}'"}
+        self.expire()
+        if delivery == ENV and len(self._handles) >= MAX_HANDLES:
+            error = "too many unused handles; run vault-run with the ones you have, or wait for them to expire"
+            return {"status": "refused", "error": error}
         purpose = purpose.strip()
         if not purpose or len(purpose) > MAX_PURPOSE_LENGTH:
             return {"status": "refused", "error": f"say what the values are for (1-{MAX_PURPOSE_LENGTH} characters)"}
@@ -163,7 +252,8 @@ class Broker:
             known = ", ".join(f.key for f in secret.private_fields)
             return {"status": "refused", "error": f"ask for one or more of this secret's private fields: {known}"}
         keys = tuple(f.key for f in secret.private_fields if f.key in wanted)
-        labels = ", ".join(secret.field(k).label for k in keys)  # type: ignore[union-attr]
+        field_labels = {k: secret.field(k).label for k in keys}  # type: ignore[union-attr]
+        labels = ", ".join(field_labels.values())
 
         if secret.share_mode == AUTO:
             values = self._values(secret, keys)
@@ -180,9 +270,9 @@ class Broker:
                     "tag": f"vault-shared-{secret.id}",
                 }
             )
-            return {"status": DONE, "secret": secret.name, "values": values}
+            delivered = self._deliver(secret.id, secret.name, field_labels, values, delivery, purpose)
+            return {"status": DONE, **delivered}
 
-        self.expire()
         if sum(1 for r in self._requests.values() if r.status == PENDING) >= MAX_PENDING:
             return {"status": "refused", "error": "too many requests are waiting; ask the user to answer them first"}
         now = self.vault.now()
@@ -193,11 +283,12 @@ class Broker:
             secret_kind=secret.kind_label,
             details={f.label: f.value for f in secret.public_fields},
             fields=keys,
-            labels={k: secret.field(k).label for k in keys},  # type: ignore[union-attr]
+            labels=field_labels,
             purpose=purpose,
             preview=preview(secret.kind, list(secret.fields)),
             created_at=now,
             expires_at=now + REQUEST_TTL_SECONDS,
+            delivery=delivery,
         )
         self._requests[req.id] = req
         log.info("pending id=%s secret=%s fields=%s", req.id, secret.id, ",".join(keys))
@@ -229,10 +320,14 @@ class Broker:
             return {"id": rid, "status": PENDING, "approve_url": self.url(f"r/{rid}")}
         if req.status in (DENIED, EXPIRED):
             return {"id": rid, "status": req.status}
+        if req.lost_to_lock:
+            note = "the vault was locked before the values were collected; request them again"
+            return {"id": rid, "status": EXPIRED, "note": note}
         if req.values is None:
             return {"id": rid, "status": DONE, "note": "the values were already returned"}
         values, req.values = req.values, None
-        result: dict[str, Any] = {"id": rid, "status": DONE, "secret": req.secret_name, "values": values}
+        delivered = self._deliver(req.secret_id, req.secret_name, req.labels, values, req.delivery, req.purpose)
+        result: dict[str, Any] = {"id": rid, "status": DONE, **delivered}
         withheld = [req.labels[k] for k in req.fields if k not in req.shared]
         if withheld:
             result["withheld"] = withheld

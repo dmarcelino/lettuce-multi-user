@@ -4,7 +4,7 @@ import logging
 import anyio
 import pytest
 
-from secret_broker.config import MAX_PENDING, REQUEST_TTL_SECONDS
+from secret_broker.config import HANDLE_TTL_SECONDS, MAX_HANDLES, MAX_PENDING, REQUEST_TTL_SECONDS
 from secret_broker.vault import VaultError
 
 from .conftest import (
@@ -206,3 +206,108 @@ async def test_restart_forgets_requests(settings, vault, vault_path, clock):
     fresh = Vault(vault_path, clock=clock, kdf=FAST_KDF)
     fresh.unlock(PASSPHRASE)
     assert (await make_broker(settings, fresh).get_result(sub["id"]))["status"] == "unknown"
+
+
+# ── env delivery: a one-time handle instead of the values ─────────────────────
+
+
+async def test_env_delivery_returns_a_handle_never_values(settings, vault, caplog):
+    caplog.set_level(logging.DEBUG)
+    card = add_card(vault)
+    broker = make_broker(settings, vault)
+
+    async def flow():
+        sub = await broker.request_secret(card, "Pay for the train", ["number", "notes"], delivery="env")
+        assert broker.request(sub["id"]).delivery == "env"
+        broker.decide(sub["id"], True, ["number"], EMAIL)
+        return await broker.get_result(sub["id"]), await broker.get_result(sub["id"])
+
+    first, second = await with_broker(broker, flow)
+    assert first["status"] == "done" and first["secret"] == "Visa" and "values" not in first
+    assert first["env"] == {"VAULT_NUMBER": "Card number"} and first["withheld"] == ["Notes"]
+    assert first["expires_in"] == HANDLE_TTL_SECONDS and first["handle"] in first["run"]
+    assert "vault-run" in first["run"]
+    assert CARD not in json.dumps(first) and SECRET not in json.dumps(first)
+    assert "handle" not in second and "values" not in second
+
+    redeemed = broker.redeem(first["handle"])
+    assert redeemed == {"secret": "Visa", "env": {"VAULT_NUMBER": CARD}}
+    assert broker.redeem(first["handle"]) is None  # single use
+    assert any(e.action == "given to a command" for e in vault.audit_log())
+    assert CARD not in caplog.text and first["handle"] not in caplog.text
+
+
+async def test_handle_expires(settings, vault, clock):
+    secret = add_address(vault, share_mode="auto")
+    broker = make_broker(settings, vault)
+    res = await with_broker(broker, lambda: broker.request_secret(secret, "delivery form", delivery="env"))
+    clock.t += HANDLE_TTL_SECONDS + 1
+    assert broker.redeem(res["handle"]) is None
+
+
+async def test_env_delivery_without_asking_returns_a_handle_at_once(settings, vault):
+    secret = add_address(vault, share_mode="auto")
+    broker = make_broker(settings, vault)
+    res = await with_broker(broker, lambda: broker.request_secret(secret, "delivery form", delivery="env"))
+    assert res["status"] == "done" and res["env"] == {"VAULT_TEXT": "Text"}
+    assert STREET not in json.dumps(res)
+    assert broker.redeem(res["handle"]) == {"secret": "Home address", "env": {"VAULT_TEXT": ADDRESS_TEXT}}
+
+
+@pytest.mark.parametrize("bad", ["", "file", None, 1])
+async def test_unknown_delivery_refused(settings, vault, bad):
+    secret = add_address(vault)
+    broker = make_broker(settings, vault)
+    res = await with_broker(broker, lambda: broker.request_secret(secret, "x", delivery=bad))
+    assert res["status"] == "refused" and "delivery" in res["error"]
+
+
+@pytest.mark.parametrize("bad", ["nope", "", None, 42])
+async def test_redeem_unknown_handle(settings, vault, bad):
+    assert make_broker(settings, vault).redeem(bad) is None
+
+
+async def test_redeem_is_audited_with_the_purpose(settings, vault):
+    secret = add_address(vault, share_mode="auto")
+    broker = make_broker(settings, vault)
+    res = await with_broker(broker, lambda: broker.request_secret(secret, "delivery form", delivery="env"))
+    broker.redeem(res["handle"])
+    entry = next(e for e in vault.audit_log() if e.action == "given to a command")
+    assert entry.detail == "Home address: Text. Purpose: delivery form"
+
+
+async def test_lock_forgets_handles_and_uncollected_values(settings, vault):
+    auto = add_address(vault, share_mode="auto")
+    card = add_card(vault)
+    broker = make_broker(settings, vault)
+
+    async def flow():
+        handle = (await broker.request_secret(auto, "delivery form", delivery="env"))["handle"]
+        sub = await broker.request_secret(card, "Pay for the train", ["number"])
+        broker.decide(sub["id"], True, ["number"], EMAIL)
+        vault.lock()
+        locked = broker.redeem(handle), await broker.get_result(sub["id"])
+        vault.unlock(PASSPHRASE)
+        return locked, broker.redeem(handle), await broker.get_result(sub["id"])
+
+    (redeemed, result), after_unlock, result_after_unlock = await with_broker(broker, flow)
+    assert redeemed is None and after_unlock is None
+    for res in (result, result_after_unlock):
+        assert res["status"] == "expired" and "locked" in res["note"] and "values" not in res
+    assert CARD not in json.dumps([result, result_after_unlock])
+
+
+async def test_unused_handles_are_capped(settings, vault):
+    secret = add_address(vault, share_mode="auto")
+    broker = make_broker(settings, vault)
+
+    async def flow():
+        for _ in range(MAX_HANDLES):
+            assert (await broker.request_secret(secret, "x", delivery="env"))["status"] == "done"
+        refused = await broker.request_secret(secret, "x", delivery="env")
+        text = await broker.request_secret(secret, "x")  # text delivery is not capped
+        return refused, text
+
+    refused, text = await with_broker(broker, flow)
+    assert refused["status"] == "refused" and "handles" in refused["error"]
+    assert text["status"] == "done"

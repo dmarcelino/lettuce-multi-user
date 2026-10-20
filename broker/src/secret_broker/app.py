@@ -1,11 +1,12 @@
-"""The ASGI app: MCP at /mcp (internal only; the tunnel forwards /secrets/ alone)
-and the vault UI at /secrets/ (every route needs a verified Access JWT, and all
+"""The ASGI app: MCP at /mcp and vault-run's /redeem (internal only; the tunnel
+forwards /secrets/ alone) and the vault UI at /secrets/ (every route needs a verified Access JWT, and all
 but setup/unlock/notifications an unlocked vault)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -44,6 +45,12 @@ SECURITY_HEADERS = {
 }
 
 Handler = Callable[[HttpRequest, str], Awaitable[Response]]
+# How agents address the vault on the stack network (compose/secrets.yml);
+# through the tunnel the host is the stack's public name. /mcp and /redeem
+# accept this host alone.
+INTERNAL_NAME = "secret-broker"
+INTERNAL_HOST = re.compile(rf"{re.escape(INTERNAL_NAME)}(:\d+)?")
+NO_STORE = {"cache-control": "no-store"}
 
 
 def _fmt_time(ts: int | None) -> str:
@@ -352,6 +359,21 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
     async def healthz(request: HttpRequest) -> Response:
         return PlainTextResponse("ok")
 
+    async def redeem(request: HttpRequest) -> Response:
+        """vault-run trades a handle for its values. The handle is the credential:
+        random, single use and short-lived. Browsers send Origin; vault-run does not."""
+        if not INTERNAL_HOST.fullmatch(request.headers.get("host", "")) or "origin" in request.headers:
+            return JSONResponse({"error": "internal only"}, status_code=403, headers=NO_STORE)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "expected JSON"}, status_code=400, headers=NO_STORE)
+        found = broker.redeem(body.get("handle")) if isinstance(body, dict) else None
+        if found is None:
+            error = "unknown or expired handle; request the secret again"
+            return JSONResponse({"error": error}, status_code=404, headers=NO_STORE)
+        return JSONResponse(found, headers=NO_STORE)
+
     open_page = {"unlocked": False}
     ui = [
         Route("/", page(approvals)),
@@ -394,7 +416,7 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
         # and sends no Origin; anything else is refused.
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=["secret-broker:*", "secret-broker"],
+            allowed_hosts=[f"{INTERNAL_NAME}:*", INTERNAL_NAME],
             allowed_origins=[],
         ),
     )
@@ -423,6 +445,7 @@ def create_app(broker: Broker, authenticator: Authenticator, vapid_public_key: s
     return Starlette(
         routes=[
             Route("/healthz", healthz),
+            Route("/redeem", redeem, methods=["POST"]),
             Route("/secrets", secrets_root),
             Mount("/secrets", routes=ui),
             Mount("/", app=mcp_app),

@@ -1144,6 +1144,10 @@ test_skills_ships_the_repo_skills() {
   ok_rc
   tar -tf "$T/exec-stdin.log" | grep -qx "scheduling-scripts/SKILL.md" || fail "scheduling-scripts not shipped"
   grep -qx "name: scheduling-scripts" "$ROOT/agent-skills/scheduling-scripts/SKILL.md" || fail "SKILL.md name mismatch"
+  for f in using-vault-secrets/SKILL.md using-vault-secrets/vault-run; do
+    tar -tf "$T/exec-stdin.log" | grep -qx "$f" || fail "$f not shipped"
+  done
+  grep -qx "name: using-vault-secrets" "$ROOT/agent-skills/using-vault-secrets/SKILL.md" || fail "SKILL.md name mismatch"
 }
 
 # The script lettucectl runs in the container, run here on a stand-in skills dir.

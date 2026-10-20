@@ -288,6 +288,8 @@ def test_mcp_tools(env):
     assert tools["get_result"]["annotations"]["readOnlyHint"] is True
     assert tools["request_secret"]["annotations"].get("readOnlyHint") is not True
     assert tools["request_secret"]["inputSchema"]["required"] == ["secret_id", "purpose"]
+    delivery = tools["request_secret"]["inputSchema"]["properties"]["delivery"]
+    assert delivery["enum"] == ["text", "env"] and delivery["default"] == "text"
 
 
 def test_mcp_refuses_public_host(env):
@@ -380,3 +382,59 @@ def test_locked_vault_answers_agents_and_notifies(env):
             break
         time.sleep(0.02)
     assert len(sender.calls) == 1
+
+
+# ── env delivery and /redeem ─────────────────────────────────────────────────
+
+REDEEM = "http://secret-broker:8000/redeem"
+
+
+def redeem(client, handle, url=REDEEM, **headers):
+    return client.post(url, json={"handle": handle}, headers={"cf-access-jwt-assertion": "", **headers})
+
+
+def test_env_delivery_end_to_end(env, caplog):
+    caplog.set_level(logging.DEBUG)
+    client, vault, sender = env
+    setup_vault(client)
+    card = add(client, CARD_FORM)
+    vault.add_subscription("https://push.example/1", "k", "a", EMAIL)
+
+    args = {"secret_id": card, "fields": ["number"], "purpose": "Pay for the train", "delivery": "env"}
+    sub, _ = call_tool(client, "request_secret", args)
+    page = client.get(f"/secrets/r/{sub['id']}").text
+    assert "pass these to a command" in page and CARD not in page
+    assert post(client, f"/secrets/r/{sub['id']}/decide", {"action": "share", "fields": ["number"]}).status_code == 303
+
+    res, raw = call_tool(client, "get_result", {"request_id": sub["id"]})
+    assert res["status"] == "done" and res["env"] == {"VAULT_NUMBER": "Card number"} and CARD not in raw
+
+    r = redeem(client, res["handle"])
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+    assert r.json() == {"secret": "Visa", "env": {"VAULT_NUMBER": CARD}}
+    again = redeem(client, res["handle"])
+    assert again.status_code == 404 and CARD not in again.text
+    assert CARD not in client.get(f"/secrets/r/{sub['id']}").text
+    assert CARD not in json.dumps([c["data"] for c in sender.calls])
+    assert CARD not in caplog.text and res["handle"] not in caplog.text
+
+
+def test_redeem_is_internal_only(env):
+    client = env[0]
+    setup_vault(client)
+    secret = add(client, {**ADDRESS, "share_mode": "auto"})
+    res, _ = call_tool(client, "request_secret", {"secret_id": secret, "purpose": "x", "delivery": "env"})
+    handle = res["handle"]
+    for r in (
+        redeem(client, handle, url=f"{ORIGIN}/redeem"),
+        redeem(client, handle, url="http://evil.example:8000/redeem"),
+        redeem(client, handle, origin="http://secret-broker:8000"),
+    ):
+        assert r.status_code == 403 and STREET not in r.text
+    get = client.get(f"{REDEEM}?handle={handle}", headers={"cf-access-jwt-assertion": ""})
+    assert get.status_code != 200 and STREET not in get.text
+    for body in ("not json", None):
+        r = client.post(REDEEM, content=body or b"[]", headers={"content-type": "application/json"})
+        assert r.status_code in (400, 404)
+    # None of that used up the handle.
+    assert redeem(client, handle).json()["env"] == {"VAULT_TEXT": ADDRESS_TEXT}

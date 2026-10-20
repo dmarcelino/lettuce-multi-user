@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Tests for the secret broker (broker/). They run in a container built from the
 # image's `test` stage, so the host needs only Docker.
+# agent-skills/ is mounted for the vault-run helper tests.
 #   tests/run-broker.sh [pytest args...]
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 docker build -q --target test -t lettuce-secret-broker:test "$ROOT/broker" >/dev/null
-docker run --rm --network none lettuce-secret-broker:test python -m pytest -q -p no:cacheprovider "$@"
+docker run --rm --network none -v "$ROOT/agent-skills:/agent-skills:ro" lettuce-secret-broker:test python -m pytest -q -p no:cacheprovider "$@"

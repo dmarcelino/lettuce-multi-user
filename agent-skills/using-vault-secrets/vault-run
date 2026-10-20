@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""vault-run HANDLE -- COMMAND [ARGS...]
+
+Redeems a single-use handle from the vault (request_secret with delivery "env"),
+runs COMMAND with the values as VAULT_<FIELD> environment variables, and scrubs
+them from its output, so they never reach the conversation. Standard library
+only: it runs with whatever python3 the app-server has.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+USAGE = "usage: vault-run HANDLE -- COMMAND [ARGS...]"
+# Shorter values (a security code) are too common to scrub without mangling output.
+MIN_SCRUB_LENGTH = 6
+# Values made of at least this many digits are also matched with separators.
+MIN_DIGITS = 8
+SEPARATED = re.compile(r"[\d .-]+")
+# How long output is still copied once the command exits; a process it left in
+# the background may hold the pipes open for ever.
+GRACE_SECONDS = 2
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(f"vault-run: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def redeem(handle: str) -> dict[str, str]:
+    base = os.environ.get("VAULT_URL", "http://secret-broker:8000").rstrip("/")
+    request = urllib.request.Request(
+        f"{base}/redeem",
+        data=json.dumps({"handle": handle}).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    # No proxies: the handle goes to the vault and nowhere else.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=15) as response:
+            body = json.load(response)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            fail('unknown or expired handle; request the secret again with delivery "env"')
+        fail(f"the vault refused the handle (HTTP {e.code})")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        fail(f"cannot reach the vault at {base}: {e}")
+    env = body.get("env") if isinstance(body, dict) else None
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        fail("unexpected answer from the vault")
+    return env
+
+
+def forms(value: str) -> set[str]:
+    """The ways programs commonly print a value: as is, URL-encoded, JSON-escaped."""
+    quoted = urllib.parse.quote(value, safe="")
+    found = {
+        value,
+        quoted,
+        re.sub("%[0-9A-F]{2}", lambda m: m.group().lower(), quoted),
+        urllib.parse.quote_plus(value),
+        json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
+    }
+    # Output is scrubbed line by line, so a multi-line value is also matched one line at a time.
+    found.update(line.strip() for line in value.splitlines())
+    return {f for f in found if len(f) >= MIN_SCRUB_LENGTH}
+
+
+def scrubber(env: dict[str, str]):
+    rules = []
+    for name, value in sorted(env.items(), key=lambda item: len(item[1]), reverse=True):
+        alternatives = [re.escape(f) for f in sorted(forms(value), key=len, reverse=True)]
+        digits = re.sub(r"\D", "", value)
+        if len(digits) >= MIN_DIGITS and SEPARATED.fullmatch(value):
+            alternatives.append("[ .-]?".join(digits))  # 4111 1111 1111 4242, 4111-1111-...
+        if alternatives:
+            rules.append((re.compile("|".join(alternatives).encode()), f"[{name}]".encode()))
+
+    def scrub(line: bytes) -> bytes:
+        for pattern, replacement in rules:
+            line = pattern.sub(replacement, line)
+        return line
+
+    return scrub
+
+
+def pump(source, target, scrub) -> None:
+    for line in iter(source.readline, b""):
+        target.write(scrub(line))
+        target.flush()
+    source.close()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[1] != "--" or argv[0] == "--":
+        fail(USAGE)
+    handle, command = argv[0], argv[2:]
+    # Before redeeming: a typo must not use up the user's approval.
+    if shutil.which(command[0]) is None:
+        fail(f"{command[0]}: command not found or not executable", 127)
+    env = redeem(handle)
+    shadowed = sorted(name for name in env if name in os.environ)
+    if shadowed:
+        fail(f"{', '.join(shadowed)} is already set (nested vault-run?); request the secret again")
+    try:
+        child = subprocess.Popen(command, env={**os.environ, **env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        fail(f"{command[0]}: command not found", 127)
+    except PermissionError:
+        fail(f"{command[0]}: permission denied", 126)
+    # Ctrl-C already reaches the command through the process group; a second
+    # SIGINT makes many programs quit without cleaning up. Signals sent to
+    # vault-run alone are passed on. Set only now: an ignored signal is inherited.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda number, _frame: child.send_signal(number))
+    scrub = scrubber(env)
+    threads = [
+        threading.Thread(target=pump, args=(child.stdout, sys.stdout.buffer, scrub), daemon=True),
+        threading.Thread(target=pump, args=(child.stderr, sys.stderr.buffer, scrub), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    code = child.wait()
+    deadline = time.monotonic() + GRACE_SECONDS
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    code = 128 - code if code < 0 else code
+    if any(t.is_alive() for t in threads):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)  # do not wait for the background process at shutdown
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -7,6 +7,8 @@ agent ──list_secrets──────────────────�
 agent ──request_secret(secret, why)───────> vault   ──push──> your phone
 you   ──https://<stack>/secrets/ ───────> vault   see what and why, untick fields, Share once / Deny
 agent ──get_result──────────────────────> vault   the values you agreed to share, once
+                                                  (or, with delivery "env", a one-time handle)
+vault-run ──/redeem (handle)─────────────> vault   the values, into one command's environment
 ```
 
 ## For the person using it
@@ -33,6 +35,11 @@ agent ──get_result───────────────────�
 
 **Connect your agents:** in Lettuce, go to **Settings -> MCP** and add an HTTP server named `vault` with URL `http://secret-broker:8000/mcp`.
 
+### Using values without the agent reading them
+An agent that will use a password, card number, security code or document number in a script (filling a form with Playwright, logging in with curl) can ask with `delivery: "env"`. The request page then says the values go to a command. Once you approve, the agent gets a **handle** instead of the values. It runs its script through `vault-run`, a helper that `lettucectl skills` installs with the `using-vault-secrets` skill. `vault-run` trades the handle for the values, gives them to that one command as `VAULT_<FIELD>` environment variables, and replaces them with `[VAULT_<FIELD>]` in the command's output, also when a card number is printed with spaces or dashes. A handle works once, for 5 minutes, and History records when it is used.
+
+Free-text secrets (addresses, companies, notes) are still read by the agent, so they normally use the default `delivery: "text"`.
+
 ## What is protected, and what is not
 - **The vault file is encrypted.** Each secret is encrypted with AES-256-GCM using a random data key. That key is stored only wrapped with a key derived from your passphrase (scrypt, 128 MiB). Secret names, fields and the history details are all encrypted. Someone who copies the vault file or a backup sees only secret ids, types and timestamps, and can only try guessing your passphrase, which scrypt makes slow.
 - **The key is only in memory:** from when you unlock until you lock, the 12-hour auto-lock, or a restart. Agents asking for secrets do not keep the vault open.
@@ -42,6 +49,7 @@ agent ──get_result───────────────────�
   - ID documents, payment cards and logins always ask. Notes, addresses, companies and memberships ask unless you switch that secret to "Agents may use it without asking".
   - Public fields (programme, document type, name on card, expiry, website, username) and the name are visible to agents, so they can pick the right secret.
 - **Once shared, a value is in the conversation.** Whatever you share goes to the agent. The AI provider sees it, and Lettuce stores the conversation unencrypted on the server. Share only what the task needs.
+- **Values passed with `vault-run` stay out of the conversation**, so the AI provider and the stored chat don't get them. That keeps a well-behaved agent from leaking them by accident. It does **not** stop an agent that has been misled, for example by a web page it read: it can redeem the handle itself, or have the command send the value somewhere. Approving stays the decision that matters; read the purpose and approve only what fits it.
 - **The vault doesn't protect against a determined administrator:** someone with root on the server can read the vault service's memory while it is unlocked, or change its code. What it does stop is someone browsing the server's files or backups.
 - **Cloudflare sees your passphrase in transit,** as it sees all traffic to your Lettuce stack.
 
@@ -58,6 +66,6 @@ agent ──get_result───────────────────�
 - **Rules for changing it:** never add a tool that lets agents edit secrets or skip approval, and never let a value or key reach a log or an unencrypted file.
 
 ## Limits
-- At most 5 requests can wait at once. A request expires after 10 minutes, and shared values wait 30 minutes for the agent to collect them.
+- At most 5 requests can wait at once. A request expires after 10 minutes, and shared values wait 30 minutes for the agent to collect them. A `vault-run` handle works once, within 5 minutes of the agent receiving it, and an agent can hold at most 10 unused handles. Locking the vault cancels every handle and every shared value the agent has not collected yet.
 - Requests that are waiting are forgotten when the vault restarts. The agent simply asks again.
 - iOS delivers notifications only to web apps added to the Home Screen, and only on iOS 16.4 or later.
