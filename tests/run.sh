@@ -14,7 +14,7 @@ setup() {
   T=$(mktemp -d)
   H=$T/home
   mkdir -p "$H/upstream/docker" "$H/.secrets" "$T/bin"
-  cp -r "$ROOT/lettucectl" "$ROOT/lib" "$ROOT/compose" "$ROOT/config.env.example" "$H/"
+  cp -r "$ROOT/lettucectl" "$ROOT/lib" "$ROOT/compose" "$ROOT/backup" "$ROOT/config.env.example" "$H/"
   cp "$ROOT"/tests/stubs/* "$T/bin/"
   touch "$H/upstream/docker/compose.yml"
   printf 'secret-api-token-123\n' >"$H/.secrets/cloudflare-api-token"
@@ -56,6 +56,14 @@ out_lacks() { ! grep -qF -- "$1" "$OUT" || fail "output unexpectedly has: $1"; }
 log_has() { grep -qF -- "$1" "$T/calls.log" || fail "call log lacks: $1"; }
 log_lacks() { ! grep -qF -- "$1" "$T/calls.log" || fail "call log unexpectedly has: $1"; }
 eq() { [[ $1 == "$2" ]] || fail "expected [$2], got [$1]"; }
+
+# broker_config [BROKER_JSON] -> the rendered compose config also holds this
+# secret-broker (default: the hardened one compose/secrets.yml renders)
+broker_config() {
+  local broker=${1:-'{"read_only":true,"cap_drop":["ALL"],"volumes":[{"type":"volume","source":"secret-broker-data","target":"/data"}]}'}
+  jq -c --argjson b "$broker" '.services["secret-broker"] = $b' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+}
 
 run_test() {
   local name=$1
@@ -224,6 +232,11 @@ test_add_writes_private_stack_env() {
   s=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
   ((${#s} == 43)) || fail "PUSH_VAPID_PRIVATE_KEY length ${#s}"
   eq "$(senv alfred PUSH_VAPID_CONTACT_EMAIL)" ops@example.org
+  s=$(senv alfred BROKER_VAPID_PUBLIC_KEY)
+  ((${#s} == 87)) || fail "BROKER_VAPID_PUBLIC_KEY length ${#s}"
+  s=$(senv alfred BROKER_VAPID_PRIVATE_KEY)
+  ((${#s} == 43)) || fail "BROKER_VAPID_PRIVATE_KEY length ${#s}"
+  [[ $(senv alfred BROKER_VAPID_PRIVATE_KEY) != "$(senv alfred PUSH_VAPID_PRIVATE_KEY)" ]] || fail "broker shares the BFF's VAPID key"
   ! grep -q '^DEV_BYPASS' "$H/stacks/alfred/stack.env" || fail "DEV_BYPASS in stack.env"
 }
 
@@ -233,6 +246,15 @@ test_add_secrets_differ_between_stacks() {
   ok_rc
   [[ $(senv alfred SESSION_SECRET) != "$(senv hal SESSION_SECRET)" ]] || fail "same SESSION_SECRET"
   [[ $(senv alfred PUSH_VAPID_PRIVATE_KEY) != "$(senv hal PUSH_VAPID_PRIVATE_KEY)" ]] || fail "same VAPID key"
+}
+
+test_add_routes_the_secrets_path_with_the_profile() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  ctl add alfred alfred@example.com
+  ok_rc
+  eq "$(jq -c '.config.ingress' <<<"$(body_of PUT /accounts/acc1/cfd_tunnel/tun1/configurations)")" \
+    '[{"hostname":"alfred.example.org","path":"^/secrets(/|$)","service":"http://secret-broker:8000"},{"hostname":"alfred.example.org","service":"http://app-server:8080"},{"service":"http_status:404"}]'
 }
 
 test_add_falls_back_when_name_resolves() {
@@ -373,15 +395,27 @@ test_up_adds_push_keys_to_existing_stack() {
   log_has "up -d"
 }
 
+test_up_adds_broker_push_keys_to_existing_stack() {
+  added
+  local pub
+  pub=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
+  sed -i '/^BROKER_VAPID_/d' "$H/stacks/alfred/stack.env"
+  ctl up alfred
+  ok_rc
+  [[ -n $(senv alfred BROKER_VAPID_PUBLIC_KEY) ]] || fail "no BROKER_VAPID_PUBLIC_KEY"
+  [[ -n $(senv alfred BROKER_VAPID_PRIVATE_KEY) ]] || fail "no BROKER_VAPID_PRIVATE_KEY"
+  eq "$(senv alfred PUSH_VAPID_PUBLIC_KEY)" "$pub"
+}
+
 test_up_keeps_existing_push_keys() {
   added
   local pub priv
   pub=$(senv alfred PUSH_VAPID_PUBLIC_KEY)
-  priv=$(senv alfred PUSH_VAPID_PRIVATE_KEY)
+  priv=$(senv alfred BROKER_VAPID_PRIVATE_KEY)
   ctl up alfred
   ok_rc
   eq "$(senv alfred PUSH_VAPID_PUBLIC_KEY)" "$pub"
-  eq "$(senv alfred PUSH_VAPID_PRIVATE_KEY)" "$priv"
+  eq "$(senv alfred BROKER_VAPID_PRIVATE_KEY)" "$priv"
 }
 
 test_up_refuses_missing_push_contact() {
@@ -401,6 +435,64 @@ test_check_refuses_missing_push_keys() {
   out_has "PUSH_VAPID_PRIVATE_KEY"
 }
 
+# with_secrets [BROKER_JSON] -> alfred runs the `secrets` profile and the
+# rendered config holds this secret-broker (default: the hardened one)
+with_secrets() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=cloudflared,secrets/' "$H/stacks/alfred/stack.env"
+  broker_config "$@"
+}
+
+test_check_accepts_the_hardened_broker() {
+  added
+  with_secrets
+  ctl check alfred
+  ok_rc
+}
+
+test_check_refuses_missing_broker_keys() {
+  added
+  sed -i '/^BROKER_VAPID_PRIVATE_KEY=/d' "$H/stacks/alfred/stack.env"
+  ctl check alfred
+  bad_rc
+  out_has "BROKER_VAPID_PRIVATE_KEY"
+}
+
+test_check_refuses_a_broker_that_is_not_hardened() {
+  added
+  local b
+  for b in \
+    '{"cap_drop":["ALL"],"volumes":[]}' \
+    '{"read_only":true,"volumes":[]}' \
+    '{"read_only":true,"cap_drop":["NET_RAW"],"volumes":[]}' \
+    '{"read_only":true,"cap_drop":["ALL"],"volumes":[{"type":"bind","source":"/srv","target":"/data"}]}'; do
+    with_secrets "$b"
+    ctl check alfred
+    bad_rc
+    out_has "secret-broker"
+  done
+}
+
+test_check_refuses_another_service_on_the_broker_volume() {
+  added
+  with_secrets
+  jq -c '.services.bff.volumes = [{"type":"volume","source":"secret-broker-data","target":"/x"}]' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+  ctl check alfred
+  bad_rc
+  out_has "bff"
+}
+
+test_check_refuses_secrets_profile_without_the_broker() {
+  added
+  with_secrets
+  jq -c 'del(.services["secret-broker"])' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+  ctl check alfred
+  bad_rc
+  out_has "secret-broker"
+}
+
 test_up_refuses_readable_stack_env() {
   added
   chmod 644 "$H/stacks/alfred/stack.env"
@@ -414,7 +506,7 @@ test_compose_ignores_the_callers_environment() {
   PUBLIC_ORIGIN=https://evil.example ctl up alfred
   ok_rc
   log_lacks "PUBLIC_ORIGIN=https://evil.example"
-  log_has "--project-directory $H/upstream/docker -f $H/upstream/docker/compose.yml -f $H/compose/hardening.yml -f $H/compose/multi.yml --env-file $H/stacks/alfred/stack.env"
+  log_has "--project-directory $H/upstream/docker -f $H/upstream/docker/compose.yml -f $H/compose/hardening.yml -f $H/compose/multi.yml -f $H/compose/secrets.yml --env-file $H/stacks/alfred/stack.env"
 }
 
 test_up_all_starts_every_stack() {
@@ -481,6 +573,15 @@ test_remove_reminds_to_delete_the_google_redirect_uri() {
   ctl remove alfred --purge <<<"alfred"
   ok_rc
   out_has "delete https://alfred.example.org/api/google/oauth/callback"
+}
+
+test_remove_says_the_vault_goes_too() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  added
+  ctl remove alfred <<<"alfred"
+  ok_rc
+  out_has "Its vault"
 }
 
 # ── profiles ─────────────────────────────────────────────────────────────────
@@ -570,6 +671,40 @@ test_profiles_repairs_drift() {
   log_has "up -d --build"
 }
 
+test_profiles_routes_secrets_for_every_stack() {
+  broker_config
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  : >"$T/calls.log"
+  ctl profiles cloudflared,search,secrets
+  ok_rc
+  eq "$(grep -c '^curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations ' "$T/calls.log")" 2
+  grep '^curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations ' "$T/calls.log" | grep -qF '"hostname":"hal.example.org","path":"^/secrets(/|$)"' ||
+    fail "hal has no /secrets route"
+  # The route is in place before the stacks start.
+  [[ $(grep -n '^curl PUT' "$T/calls.log" | tail -1 | cut -d: -f1) -lt $(grep -n 'up -d --build' "$T/calls.log" | head -1 | cut -d: -f1) ]] ||
+    fail "stacks started before their route"
+}
+
+test_profiles_dropping_secrets_removes_the_route() {
+  sed -i 's/^PROFILES=.*/PROFILES=cloudflared,secrets/' "$H/config.env"
+  broker_config
+  added
+  ctl profiles cloudflared
+  ok_rc
+  log_has "curl PUT /accounts/acc1/cfd_tunnel/tun1/configurations"
+  log_lacks "secret-broker"
+}
+
+test_profiles_reports_a_failed_route_update() {
+  broker_config
+  added
+  stub 'STUB_CF_FAIL="PUT /accounts/acc1/cfd_tunnel/tun1/configurations"'
+  ctl profiles cloudflared,search,secrets
+  bad_rc
+  out_has "run the same command again"
+}
+
 test_profiles_refuses_a_bad_list() {
   added
   local l
@@ -607,6 +742,734 @@ test_list_shows_stacks_and_hosts() {
   ok_rc
   out_has "alfred"
   out_has "https://hal.example.org"
+}
+
+# ── shell ────────────────────────────────────────────────────────────────────
+# agents NAME... -> what `letta agents list` answers: one agent per name, id agent-<n>
+agents() {
+  local i=0 n items=()
+  for n in "$@"; do
+    i=$((i + 1))
+    items+=("$(jq -nc --arg id "agent-$i" --arg n "$n" '{id: $id, name: $n, system: "long prompt"}')")
+  done
+  printf '{"items":[%s]}\n' "$(IFS=,; echo "${items[*]}")" >"$T/agents.json"
+}
+
+test_shell_without_agent_opens_work() {
+  added
+  ctl shell alfred </dev/null
+  ok_rc
+  log_has "-p lettuce-alfred"
+  log_has "exec -T -w /work app-server bash"
+  log_lacks "letta agents list"
+}
+
+# workspaces ID... -> alfred's agents with these ids have a workspace
+workspaces() {
+  local id
+  for id in "$@"; do mkdir -p "$H/stacks/alfred/state/workspaces/$id"; done
+}
+
+test_shell_opens_the_agents_workspace() {
+  added
+  agents Alfred Lucius
+  workspaces agent-2
+  ctl shell alfred lucius </dev/null
+  ok_rc
+  out_has "alfred: Lucius (agent-2)"
+  log_has "exec -T -w /work/agent-2 -e AGENT_ID=agent-2 -e LETTA_AGENT_ID=agent-2 -e AGENT_NAME=Lucius -e USER_CWD=/work/agent-2 app-server bash -c"
+  # shellcheck disable=SC2016 # the literal script lettucectl passes to the container
+  log_has 'export MEMORY_DIR=$LETTA_LOCAL_BACKEND_DIR/memfs/$AGENT_ID/memory'
+}
+
+test_shell_passes_stdin_to_the_agents_shell() {
+  added
+  agents Lucius
+  workspaces agent-1
+  ctl shell alfred lucius <<<'ls'
+  ok_rc
+  eq "$(cat "$T/exec-stdin.log")" ls
+}
+
+test_shell_accepts_an_agent_id() {
+  added
+  agents Alfred Lucius
+  workspaces agent-1
+  ctl shell alfred agent-1 </dev/null
+  ok_rc
+  log_has "-e AGENT_NAME=Alfred"
+}
+
+test_shell_keeps_spaces_in_agent_names() {
+  added
+  agents "The Finn"
+  workspaces agent-1
+  ctl shell alfred "the finn" </dev/null
+  ok_rc
+  log_has "-e AGENT_NAME=The Finn -e"
+}
+
+test_shell_refuses_an_agent_without_a_workspace() {
+  added
+  agents Alfred Lucius
+  ctl shell alfred lucius </dev/null
+  bad_rc
+  out_has "alfred: no workspace for Lucius at $H/stacks/alfred/state/workspaces/agent-2"
+  log_lacks "-w /work"
+}
+
+test_shell_lists_agents_when_none_match() {
+  added
+  agents Alfred Lucius
+  ctl shell alfred hal </dev/null
+  bad_rc
+  out_has "alfred has no agent 'hal'; agents: Alfred, Lucius"
+  log_lacks "-w /work"
+}
+
+test_shell_refuses_ambiguous_agent_names() {
+  added
+  agents Saburo saburo
+  ctl shell alfred Saburo </dev/null
+  bad_rc
+  out_has "use an id: agent-1 agent-2"
+  log_lacks "-w /work"
+}
+
+test_shell_fails_when_agents_cannot_be_listed() {
+  added
+  stub STUB_AGENTS_RC=1
+  ctl shell alfred lucius </dev/null
+  bad_rc
+  out_has "could not list agents"
+}
+
+test_shell_rejects_unknown_stacks() {
+  ctl shell hal </dev/null
+  bad_rc
+  out_has "no stack named 'hal'"
+}
+
+# ── toolbox ──────────────────────────────────────────────────────────────────
+# toolbox_ready -> alfred with agents Alfred and Lucius (agent-2), an app-server
+# image and Lucius's workspace; the operator's home is the empty $T/u
+toolbox_ready() {
+  added
+  agents Alfred Lucius
+  jq -c '.services["app-server"].image = "lettuce-app-server:test"' "$T/compose-config.json" >"$T/c.json"
+  mv "$T/c.json" "$T/compose-config.json"
+  mkdir -p "$H/stacks/alfred/state/workspaces/agent-2" "$T/u"
+}
+
+# tb ARGS... -> `toolbox alfred ARGS...` with $T/u as home, so nothing of the real
+# operator's is read; TB_SOCK and TB_CLAUDE stand in for their variables
+tb() {
+  HOME=$T/u XDG_CONFIG_HOME="" CLAUDE_CONFIG_DIR="" SSH_AUTH_SOCK=${TB_SOCK:-} \
+    CLAUDE_CODE_OAUTH_TOKEN=${TB_CLAUDE:-} ctl toolbox alfred "$@" </dev/null
+}
+
+# toolbox_tools -> the operator has ssh, git, gh and Claude Code set up
+toolbox_tools() {
+  mkdir -p "$T/u/.ssh" "$T/u/.claude/skills"
+  touch "$T/u/.ssh/known_hosts" "$T/u/.gitconfig" "$T/u/.claude/CLAUDE.md" "$T/agent.sock"
+  TB_SOCK=$T/agent.sock
+  stub STUB_GH_TOKEN=gh-tok-1
+  stub STUB_SECRET_TOOL=claude-tok-1
+}
+
+# toolbox_file LINE... -> the operator's personal toolbox file
+toolbox_file() {
+  mkdir -p "$T/u/.config/lettucectl"
+  printf '%s\n' "$@" >"$T/u/.config/lettucectl/toolbox"
+  chmod 600 "$T/u/.config/lettucectl/toolbox"
+}
+
+run_env() { cat "$T/run-env.log" 2>/dev/null; }
+
+test_toolbox_opens_the_agents_workspace() {
+  toolbox_ready
+  tb lucius
+  ok_rc
+  out_has "alfred: Lucius (agent-2)"
+  log_has "--hostname toolbox-alfred --label lettucectl.toolbox=alfred --label lettucectl.agent=agent-2 --security-opt no-new-privileges --memory 8g --pids-limit 4096 --tmpfs /root:mode=700,exec --tmpfs /tmp:exec"
+  log_has "-v $H/stacks/alfred/state/workspaces/agent-2:/work/agent-2 -w /work/agent-2"
+  log_has "-e AGENT_ID=agent-2 -e LETTA_AGENT_ID=agent-2 -e AGENT_NAME=Lucius -e USER_CWD=/work/agent-2"
+  log_has "-e PATH=/opt/claude-code/bin:/usr/local/bin:/usr/bin:/bin"
+  log_has " lettuce-app-server:test bash"
+}
+
+test_toolbox_clears_the_images_compose_labels() {
+  toolbox_ready
+  tb lucius
+  ok_rc
+  # Inherited from the Compose-built image, they would make the toolbox one of the
+  # stack's app-server containers to Compose and `stale_services`.
+  log_has "docker run --rm --init -i --label com.docker.compose.project= --label com.docker.compose.service= --hostname"
+  log_lacks "org.opencontainers.image.title="
+}
+
+test_toolbox_runs_a_command() {
+  toolbox_ready
+  tb lucius claude --resume
+  ok_rc
+  log_has " lettuce-app-server:test claude --resume"
+}
+
+test_toolbox_skips_what_the_host_lacks() {
+  toolbox_ready
+  tb lucius
+  ok_rc
+  log_lacks "ssh-agent.sock"
+  log_lacks ".gitconfig"
+  log_lacks "/root/.claude"
+  log_lacks "GH_TOKEN"
+  log_lacks "CLAUDE_CODE_OAUTH_TOKEN"
+  out_has "toolbox: nothing of yours found"
+  out_has "claude setup-token"
+}
+
+test_toolbox_brings_in_the_operators_tools() {
+  toolbox_ready
+  toolbox_tools
+  tb lucius
+  ok_rc
+  out_has "toolbox: ssh-agent, git, gh, claude config, claude token"
+  out_lacks "claude setup-token"
+  log_has "-v $T/agent.sock:/run/ssh-agent.sock -e SSH_AUTH_SOCK=/run/ssh-agent.sock"
+  log_has "-v $T/u/.ssh/known_hosts:/root/.ssh/known_hosts:ro"
+  log_has "-v $T/u/.gitconfig:/root/.gitconfig:ro"
+  log_has "-e GIT_CONFIG_KEY_1=credential.https://github.com.helper -e GIT_CONFIG_VALUE_1=!gh auth git-credential"
+  log_has "-v $T/u/.claude/CLAUDE.md:/root/.claude/CLAUDE.md:ro"
+  log_has "-v $T/u/.claude/skills:/root/.claude/skills:ro"
+  log_lacks "settings.json"
+}
+
+test_toolbox_passes_tokens_by_name_only() {
+  toolbox_ready
+  toolbox_tools
+  tb lucius
+  ok_rc
+  log_has "-e GH_TOKEN"
+  log_has "-e CLAUDE_CODE_OAUTH_TOKEN"
+  log_lacks "gh-tok-1"
+  log_lacks "claude-tok-1"
+  run_env | grep -qx "GH_TOKEN=gh-tok-1" || fail "GH_TOKEN not passed: $(run_env)"
+  run_env | grep -qx "CLAUDE_CODE_OAUTH_TOKEN=claude-tok-1" || fail "Claude token not passed: $(run_env)"
+}
+
+test_toolbox_prefers_the_callers_claude_token() {
+  toolbox_ready
+  toolbox_tools
+  TB_CLAUDE=env-tok-1 tb lucius
+  ok_rc
+  run_env | grep -qx "CLAUDE_CODE_OAUTH_TOKEN=env-tok-1" || fail "caller's token not used: $(run_env)"
+}
+
+test_toolbox_reads_the_personal_file() {
+  toolbox_ready
+  mkdir -p "$T/u/shared" "$T/u/.aws" "$T/data"
+  touch "$T/u/.aws/config"
+  toolbox_file "# extras" "" \
+    "mount ~/shared" \
+    "mount ~/.aws/config ~/.aws/config" \
+    "mount $T/data /data rw" \
+    "secret TEST_TOKEN printf tok-123" \
+    "env AWS_PROFILE=dev"
+  tb lucius
+  ok_rc
+  out_has "+5 from $T/u/.config/lettucectl/toolbox"
+  log_has "-v $T/u/shared:$T/u/shared:ro"
+  log_has "-v $T/u/.aws/config:/root/.aws/config:ro"
+  log_has "-v $T/data:/data:rw"
+  log_has "-e AWS_PROFILE=dev"
+  log_has "-e TEST_TOKEN"
+  log_lacks "tok-123"
+  run_env | grep -qx "TEST_TOKEN=tok-123" || fail "secret not passed: $(run_env)"
+}
+
+test_toolbox_file_overrides_built_in_tokens() {
+  toolbox_ready
+  toolbox_tools
+  toolbox_file "secret GH_TOKEN printf file-tok"
+  tb lucius
+  ok_rc
+  eq "$(run_env | grep -c '^GH_TOKEN=')" 1
+  run_env | grep -qx "GH_TOKEN=file-tok" || fail "file token not used: $(run_env)"
+}
+
+test_toolbox_never_sources_the_personal_file() {
+  toolbox_ready
+  # shellcheck disable=SC2016 # the literal line a sourced file would run
+  toolbox_file 'mount $(touch '"$T"'/pwned)'
+  tb lucius
+  bad_rc
+  [[ ! -e $T/pwned ]] || fail "the personal file was executed"
+  log_lacks "docker run"
+}
+
+test_toolbox_refuses_unknown_directives() {
+  toolbox_ready
+  toolbox_file "volume ~/shared"
+  tb lucius
+  bad_rc
+  out_has "unknown directive 'volume'"
+  log_lacks "docker run"
+}
+
+test_toolbox_refuses_missing_mounts() {
+  toolbox_ready
+  toolbox_file "mount ~/nope"
+  tb lucius
+  bad_rc
+  out_has "$T/u/nope does not exist"
+  log_lacks "docker run"
+}
+
+test_toolbox_refuses_a_personal_file_others_can_write() {
+  toolbox_ready
+  toolbox_file "env A=b"
+  chmod 666 "$T/u/.config/lettucectl/toolbox"
+  tb lucius
+  bad_rc
+  out_has "writable by others"
+  log_lacks "docker run"
+}
+
+test_toolbox_fails_when_a_secret_command_fails() {
+  toolbox_ready
+  toolbox_file "secret TEST_TOKEN false"
+  tb lucius
+  bad_rc
+  out_has "secret TEST_TOKEN"
+  log_lacks "docker run"
+}
+
+test_toolbox_needs_the_stack_image() {
+  toolbox_ready
+  stub STUB_IMAGE_RC=1
+  tb lucius
+  bad_rc
+  out_has "lettucectl up alfred"
+  log_lacks "docker run"
+}
+
+test_toolbox_needs_the_agents_workspace() {
+  toolbox_ready
+  rmdir "$H/stacks/alfred/state/workspaces/agent-2"
+  tb lucius
+  bad_rc
+  out_has "no workspace"
+  log_lacks "docker run"
+}
+
+test_toolbox_lists_agents_when_none_match() {
+  toolbox_ready
+  tb hal
+  bad_rc
+  out_has "alfred has no agent 'hal'; agents: Alfred, Lucius"
+  log_lacks "docker run"
+}
+
+test_toolbox_requires_an_agent() {
+  toolbox_ready
+  tb
+  bad_rc
+  out_has "usage: lettucectl toolbox"
+}
+
+# ── skills ───────────────────────────────────────────────────────────────────
+# skill NAME... -> an agent skill in the repo copy
+skill() {
+  local s
+  for s in "$@"; do
+    mkdir -p "$H/agent-skills/$s"
+    printf -- '---\nname: %s\ndescription: test\n---\n' "$s" >"$H/agent-skills/$s/SKILL.md"
+  done
+}
+shipped() { tar -tf "$T/exec-stdin.log" | LC_ALL=C sort | paste -sd' '; }
+
+test_skills_installs_every_skill_dir() {
+  added
+  skill alpha beta
+  mkdir -p "$H/agent-skills/notes"
+  touch "$H/agent-skills/notes/README.md"
+  ctl skills alfred
+  ok_rc
+  out_has "alfred: 2 skill(s) installed"
+  eq "$(shipped)" "alpha/ alpha/SKILL.md beta/ beta/SKILL.md"
+  log_has "-p lettuce-alfred"
+  log_has "exec -T app-server sh -c"
+  log_has "sh /root/.letta/skills alpha beta"
+}
+
+test_skills_all_covers_every_stack() {
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  skill alpha
+  : >"$T/calls.log"
+  ctl skills all
+  ok_rc
+  out_has "alfred: 1 skill(s) installed"
+  out_has "hal: 1 skill(s) installed"
+  log_has "-p lettuce-hal"
+}
+
+test_skills_removes_all_when_the_repo_has_none() {
+  added
+  ctl skills alfred
+  ok_rc
+  out_has "alfred: 0 skill(s) installed"
+  eq "$(shipped)" ""
+}
+
+test_skills_refuses_upstream_names() {
+  added
+  mkdir -p "$H/upstream/docker/agent-skills/serving-web-apps"
+  skill serving-web-apps
+  ctl skills alfred
+  bad_rc
+  out_has "skill 'serving-web-apps' is also shipped by upstream Lettuce"
+  log_lacks " exec "
+}
+
+test_skills_refuses_bad_names() {
+  added
+  skill My.Skill
+  ctl skills alfred
+  bad_rc
+  out_has "invalid skill name 'My.Skill'"
+  log_lacks " exec "
+}
+
+test_skills_fails_when_the_stack_is_down() {
+  added
+  skill alpha
+  stub STUB_EXEC_RC=1
+  ctl skills alfred
+  bad_rc
+  out_has "alfred: could not install skills (is the stack up?)"
+}
+
+test_skills_rejects_unknown_stacks() {
+  ctl skills hal
+  bad_rc
+  out_has "no stack named 'hal'"
+}
+
+test_skills_ships_the_repo_skills() {
+  added
+  cp -r "$ROOT/agent-skills" "$H/"
+  ctl skills alfred
+  ok_rc
+  tar -tf "$T/exec-stdin.log" | grep -qx "scheduling-scripts/SKILL.md" || fail "scheduling-scripts not shipped"
+  grep -qx "name: scheduling-scripts" "$ROOT/agent-skills/scheduling-scripts/SKILL.md" || fail "SKILL.md name mismatch"
+}
+
+# The script lettucectl runs in the container, run here on a stand-in skills dir.
+test_skills_script_replaces_only_its_own_skills() {
+  added
+  skill alpha beta
+  ctl skills alfred
+  ok_rc
+  local d=$T/skills
+  mkdir -p "$d/serving-web-apps" "$d/old" "$d/alpha"
+  touch "$d/serving-web-apps/SKILL.md" "$d/old/SKILL.md" "$d/alpha/stale.txt"
+  printf 'old\nalpha\n' >"$d/.lettucectl-skills"
+  sh -c "$(cat "$T/exec-script")" sh "$d" alpha beta <"$T/exec-stdin.log"
+  eq "$(cd "$d" && find . | LC_ALL=C sort | paste -sd' ')" \
+    ". ./.lettucectl-skills ./alpha ./alpha/SKILL.md ./beta ./beta/SKILL.md ./serving-web-apps ./serving-web-apps/SKILL.md"
+  eq "$(paste -sd' ' "$d/.lettucectl-skills")" "alpha beta"
+}
+
+test_skills_script_keeps_skills_on_a_broken_stream() {
+  added
+  skill alpha
+  ctl skills alfred
+  ok_rc
+  local d=$T/skills
+  mkdir -p "$d/alpha"
+  touch "$d/alpha/SKILL.md"
+  printf 'alpha\n' >"$d/.lettucectl-skills"
+  ! sh -c "$(cat "$T/exec-script")" sh "$d" alpha <<<'not a tar' 2>/dev/null || fail "script accepted a broken stream"
+  eq "$(cd "$d" && find . | LC_ALL=C sort | paste -sd' ')" ". ./.lettucectl-skills ./alpha ./alpha/SKILL.md"
+}
+
+# ── backup ───────────────────────────────────────────────────────────────────
+# backed -> a fresh alfred stack with a backup destination at $B
+backed() {
+  added
+  B=$T/bk
+  mkdir -p "$B"
+}
+backup_runs() { grep -c "^docker run .* lettuce-backup:local sh -c" "$T/calls.log" || true; }
+snapshots() { find "$B/alfred" -mindepth 1 -maxdepth 1 ! -name .lock -printf '%f\n' | LC_ALL=C sort | paste -sd' '; }
+
+test_backup_rejects_bad_destinations() {
+  backed
+  ctl backup alfred "$T/missing"
+  bad_rc
+  out_has "is not a directory"
+  ctl backup alfred backup-host:/srv/backups
+  bad_rc
+  out_has "cannot contain ':' or ','"
+  ctl backup alfred "$H/stacks/alfred"
+  bad_rc
+  out_has "cannot be inside"
+  # The repo is public, and a backup holds stack.env and logins.
+  mkdir -p "$H/backups"
+  ctl backup alfred "$H/backups"
+  bad_rc
+  out_has "cannot be inside $H"
+  ctl backup alfred "$H"
+  bad_rc
+  out_has "cannot be inside $H"
+  ctl backup alfred "$B" --pause --live
+  bad_rc
+  out_has "use --pause or --live, not both"
+  ctl backup alfred "$B" --keep 0
+  bad_rc
+  out_has "--keep needs"
+  ctl backup alfred
+  bad_rc
+  out_has "usage: lettucectl backup"
+  log_lacks "docker run"
+}
+
+test_backup_copies_a_stopped_stack_without_asking() {
+  backed
+  stub STUB_VOLUME_RC=1
+  ctl backup alfred "$B"
+  ok_rc
+  out_lacks "Choice"
+  out_lacks "vault"
+  log_lacks " pause"
+  log_has "docker build -q -t lettuce-backup:local $H/backup"
+  # --init: sh as PID 1 would ignore the signal docker forwards on Ctrl-C.
+  log_has "docker run --rm --init --network none --read-only --tmpfs /tmp --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --label lettucectl.backup=alfred"
+  log_has "-v $H/stacks/alfred/state:/src/state:ro -v $H/stacks/alfred/stack.env:/src/stack.env:ro -v $B/alfred:/dst lettuce-backup:local"
+  log_has "sh rsync /src /dst $(id -u):$(id -g)  .partial-"
+  log_has "state/letta-home/mod-cache state/letta-home/claude/paste-cache state/letta-home/claude/backups"
+  log_lacks "state/tools"
+  log_lacks "/src/vault"
+  [[ $(snapshots) =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || fail "expected one snapshot, got: $(snapshots)"
+  eq "$(stat -c %a "$B/alfred")" 700
+  out_has "alfred: $B/alfred/$(snapshots)"
+}
+
+test_backup_leaves_out_upstream_skills_and_tools() {
+  backed
+  mkdir -p "$H/upstream/docker/agent-skills/serving-web-apps"
+  ctl backup alfred "$B" --no-tools
+  ok_rc
+  log_has "state/letta-home/skills/serving-web-apps state/tools"
+}
+
+test_backup_links_to_the_previous_snapshot() {
+  backed
+  mkdir -p "$B/alfred/20260101T000000Z" "$B/alfred/20260102T000000Z" "$B/alfred/notes"
+  ctl backup alfred "$B"
+  ok_rc
+  log_has "$(id -u):$(id -g) 20260102T000000Z .partial-"
+}
+
+test_backup_removes_what_an_interrupted_run_left() {
+  backed
+  mkdir -p "$B/alfred/.partial-20260101T000000Z"
+  ctl backup alfred "$B"
+  ok_rc
+  log_has "-v $B/alfred:/dst lettuce-backup:local rm -rf -- /dst/.partial-20260101T000000Z"
+}
+
+test_backup_includes_the_vault() {
+  backed
+  with_secrets
+  ctl backup alfred "$B"
+  ok_rc
+  log_has "docker volume inspect lettuce-alfred_secret-broker-data"
+  log_has "-v lettuce-alfred_secret-broker-data:/src/vault:ro"
+}
+
+# Turning the profile off keeps the volume; it still holds the vault.
+test_backup_includes_a_vault_left_by_a_dropped_profile() {
+  backed
+  ctl backup alfred "$B"
+  ok_rc
+  log_has "-v lettuce-alfred_secret-broker-data:/src/vault:ro"
+}
+
+test_backup_skips_a_vault_that_does_not_exist() {
+  backed
+  with_secrets
+  stub STUB_VOLUME_RC=1
+  ctl backup alfred "$B"
+  ok_rc
+  out_has "the vault volume lettuce-alfred_secret-broker-data does not exist yet"
+  log_lacks "/src/vault"
+}
+
+test_backup_pauses_a_running_stack_when_asked() {
+  backed
+  containers alfred app-server bff
+  ctl backup alfred "$B" <<<"p"
+  ok_rc
+  out_has "alfred is running. A live copy can catch"
+  eq "$(grep -oE ' (pause|unpause)$|lettuce-backup:local sh -c' "$T/calls.log" | paste -sd,)" \
+    " pause,lettuce-backup:local sh -c, unpause"
+}
+
+test_backup_copies_live_when_asked() {
+  backed
+  containers alfred app-server
+  ctl backup alfred "$B" <<<"l"
+  ok_rc
+  log_lacks " pause"
+  eq "$(backup_runs)" 1
+}
+
+test_backup_aborts_without_an_answer() {
+  backed
+  containers alfred app-server
+  ctl backup alfred "$B" </dev/null
+  bad_rc
+  out_has "aborted (to answer ahead of time, as from cron: --pause or --live)"
+  eq "$(backup_runs)" 0
+  ctl backup alfred "$B" <<<"y"
+  bad_rc
+  eq "$(backup_runs)" 0
+}
+
+test_backup_flags_answer_ahead_of_time() {
+  backed
+  containers alfred app-server
+  ctl backup alfred "$B" --pause </dev/null
+  ok_rc
+  out_lacks "Choice"
+  log_has " unpause"
+}
+
+test_backup_unpauses_when_the_copy_fails() {
+  backed
+  containers alfred app-server
+  stub STUB_RUN_RC=1
+  ctl backup alfred "$B" --pause
+  bad_rc
+  out_has "alfred: the copy failed"
+  log_has " unpause"
+  eq "$(snapshots)" ""
+}
+
+test_backup_unpauses_when_the_pause_fails_partway() {
+  backed
+  containers alfred app-server bff
+  stub STUB_PAUSE_RC=1
+  ctl backup alfred "$B" --pause
+  bad_rc
+  out_has "alfred: could not pause the stack"
+  log_has " unpause"
+  eq "$(backup_runs)" 0
+}
+
+test_backup_refuses_a_second_run_of_the_same_stack() {
+  command -v flock >/dev/null || return 0
+  backed
+  mkdir -p "$B/alfred/.partial-20260101T000000Z"
+  local fd
+  exec {fd}>"$B/alfred/.lock"
+  flock "$fd"
+  ctl backup alfred "$B"
+  exec {fd}>&-
+  bad_rc
+  out_has "alfred: another backup of alfred is running"
+  [[ -d $B/alfred/.partial-20260101T000000Z ]] || fail "the running backup's copy was deleted"
+  eq "$(backup_runs)" 0
+}
+
+test_backup_all_goes_on_after_a_failure() {
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  B=$T/bk
+  mkdir -p "$B"
+  containers alfred app-server
+  ctl backup all "$B" </dev/null
+  bad_rc
+  out_has "aborted"
+  out_has "hal: $B/hal/"
+  out_has "backup failed for: alfred"
+  eq "$(find "$B" -mindepth 2 -maxdepth 2 -name '20*' | sed "s|^$B/||; s|/.*||")" hal
+}
+
+test_backup_compress_writes_a_private_archive() {
+  backed
+  ctl backup alfred "$B" --compress
+  ok_rc
+  log_has "sh tar /src     state/letta-home/mod-cache"
+  log_lacks ":/dst"
+  [[ $(snapshots) =~ ^[0-9]{8}T[0-9]{6}Z\.tar\.gz$ ]] || fail "expected one archive, got: $(snapshots)"
+  eq "$(stat -c %a "$B/alfred/$(snapshots)")" 600
+}
+
+test_backup_keep_removes_older_snapshots() {
+  backed
+  mkdir -p "$B/alfred/20260101T000000Z" "$B/alfred/20260102T000000Z" "$B/alfred/20260103T000000Z" "$B/alfred/notes"
+  ctl backup alfred "$B" --keep 2
+  ok_rc
+  log_has "rm -rf -- /dst/20260101T000000Z /dst/20260102T000000Z"
+  log_lacks "/dst/20260103T000000Z"
+  log_lacks "/dst/notes"
+  out_has "alfred: removed 2 older backup(s)"
+}
+
+test_backup_keep_removes_older_archives() {
+  backed
+  mkdir -p "$B/alfred/20260103T000000Z"
+  touch "$B/alfred/20260101T000000Z.tar.gz" "$B/alfred/20260102T000000Z.tar.gz" "$B/alfred/notes.tar.gz"
+  ctl backup alfred "$B" --compress --keep 2
+  ok_rc
+  [[ ! -e $B/alfred/20260101T000000Z.tar.gz ]] || fail "oldest archive kept"
+  [[ -e $B/alfred/20260102T000000Z.tar.gz && -e $B/alfred/notes.tar.gz && -d $B/alfred/20260103T000000Z ]] ||
+    fail "removed more than the oldest archive: $(snapshots)"
+}
+
+test_backup_all_covers_every_stack() {
+  ctl add alfred alfred@example.com
+  ctl add hal hal@example.com
+  B=$T/bk
+  mkdir -p "$B"
+  ctl backup all "$B"
+  ok_rc
+  [[ -d $B/alfred && -d $B/hal ]] || fail "not every stack backed up"
+  log_has "lettucectl.backup=hal"
+}
+
+# The script lettucectl runs in the container, run here with the host's rsync and
+# tar on a stand-in state.
+test_backup_script_copies_what_matters() {
+  command -v rsync >/dev/null || return 0
+  backed
+  mkdir -p "$H/upstream/docker/agent-skills/serving-web-apps"
+  ctl backup alfred "$B" --no-tools
+  ok_rc
+  local src=$T/src dst=$T/dst args got
+  mkdir -p "$src/state/letta-home/"{mod-cache,skills/serving-web-apps,skills/scheduling-scripts,skills/from-settings} \
+    "$src/state/letta-home/claude/projects" "$src/state/workspaces/agent-1" "$src/state/tools/bin" "$src/vault" "$dst"
+  touch "$src/stack.env" "$src/state/letta-home/mod-cache/x" "$src/state/letta-home/claude/projects/t.jsonl" \
+    "$src/state/letta-home/skills/serving-web-apps/SKILL.md" "$src/state/letta-home/skills/scheduling-scripts/SKILL.md" \
+    "$src/state/letta-home/skills/from-settings/SKILL.md" "$src/state/workspaces/agent-1/notes.md" \
+    "$src/state/tools/bin/uv" "$src/vault/vault.db"
+  printf 'scheduling-scripts\n' >"$src/state/letta-home/skills/.lettucectl-skills"
+  # The same excludes lettucectl passed, after MODE SRC DST OWNER PREV OUT.
+  args=$(grep -o ' \.partial-[^ ]* .*' "$T/calls.log" | head -1 | cut -d' ' -f3-)
+  # shellcheck disable=SC2086 # the excludes are single words
+  sh -c "$(cat "$T/run-script")" sh rsync "$src" "$dst" "$(id -u):$(id -g)" "" s1 $args
+  got=$(cd "$dst/s1" && find . -type f | LC_ALL=C sort | paste -sd' ')
+  eq "$got" "./stack.env ./state/letta-home/claude/projects/t.jsonl ./state/letta-home/skills/from-settings/SKILL.md ./state/workspaces/agent-1/notes.md ./vault/vault.db"
+  # shellcheck disable=SC2086
+  sh -c "$(cat "$T/run-script")" sh rsync "$src" "$dst" "$(id -u):$(id -g)" s1 s2 $args
+  eq "$(stat -c %h "$dst/s2/state/workspaces/agent-1/notes.md")" 2
+  # shellcheck disable=SC2086
+  sh -c "$(cat "$T/run-script")" sh tar "$src" "" "" "" "" $args >"$T/a.tar.gz"
+  got=$(tar -tzf "$T/a.tar.gz" | grep -v '/$' | LC_ALL=C sort | paste -sd' ')
+  eq "$got" "./stack.env ./state/letta-home/claude/projects/t.jsonl ./state/letta-home/skills/from-settings/SKILL.md ./state/workspaces/agent-1/notes.md ./vault/vault.db"
 }
 
 for t in $(declare -F | awk '$3 ~ /^test_/ { print $3 }'); do

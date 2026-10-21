@@ -103,10 +103,15 @@ cf_tunnel_token() {
   jq -r '.' <<<"$r"
 }
 
-# cf_tunnel_configure ACCOUNT TUNNEL_ID HOST -> HOST to the stack's app-server, 404 for anything else
+# cf_tunnel_configure ACCOUNT TUNNEL_ID HOST PROFILES -> HOST to the stack's
+# app-server, 404 for anything else; with the `secrets` profile, /secrets/ on
+# HOST goes to the vault (secret-broker) first (same hostname, same Access app).
 cf_tunnel_configure() {
-  cf_api PUT "/accounts/$1/cfd_tunnel/$2/configurations" "$(jq -cn --arg h "$3" '{config: {ingress: [
-    {hostname: $h, service: "http://app-server:8080"}, {service: "http_status:404"}]}}')" >/dev/null
+  local secrets=false
+  has_profile "${4:-}" secrets && secrets=true
+  cf_api PUT "/accounts/$1/cfd_tunnel/$2/configurations" "$(jq -cn --arg h "$3" --argjson s "$secrets" '{config: {ingress: (
+    (if $s then [{hostname: $h, path: "^/secrets(/|$)", service: "http://secret-broker:8000"}] else [] end)
+    + [{hostname: $h, service: "http://app-server:8080"}, {service: "http_status:404"}])}}')" >/dev/null
 }
 
 # cf_dns_cname_create ZONE HOST TUNNEL_ID COMMENT -> record id

@@ -29,10 +29,15 @@ Operation (<target> is a stack name or "all")
   down <target>                 stop
   restart <target>              down + up (app-server and bff share a namespace; never restart one alone)
   check <target>                refuse unsafe or inconsistent configuration
+  skills <target>               install agent-skills/ into running stacks (every agent of the stack)
+  backup <target> <dir> [opts]  copy agents, memory, workspaces, tools and vault to a snapshot in <dir>/<name>/
+                                (--compress: a tar.gz instead; --no-tools; --pause|--live; --keep N)
   status                        containers and health of every stack
   list                          stacks, hostnames and allowed users
   logs <name> [service]         follow logs
   compose <name> <args...>      any other docker compose command for one stack
+  shell <name> [agent]          bash in the app-server, in /work or in an agent's workspace (name or id)
+  toolbox <name> <agent> [cmd]  bash (or cmd) in an agent's workspace with your own ssh, git, gh and Claude Code
 EOF
 }
 
@@ -106,6 +111,59 @@ EOF
 google_reminder() {
   info "Google: add $(google_redirect_uri "$1") to your Google OAuth client's redirect URIs,"
   info "  then connect in that stack's Settings -> Google (docs/google-setup.md)"
+}
+
+# route_stack NAME -> re-applies the stack's tunnel routes for its current
+# profiles; a stack whose setup never got a tunnel is skipped
+route_stack() {
+  local f tun
+  f=$(stack_env "$1")
+  tun=$(env_get "$f" CF_TUNNEL_ID)
+  [[ -n $tun && -n $(env_get "$f" CF_DNS_RECORD_ID) ]] || return 0
+  cf_tunnel_configure "$(cfg CF_ACCOUNT_ID)" "$tun" "$(env_get "$f" LETTUCE_HOSTNAME)" "$(env_get "$f" COMPOSE_PROFILES)"
+}
+
+# Run by sh in the app-server as: sh -c "$SKILLS_INSTALL" sh DIR SKILL... with a tar
+# of the skills on stdin. Replaces what the last run installed (the manifest) and
+# leaves every other skill in DIR alone. Extracting into a dot directory first
+# means a broken stream changes nothing; skill discovery ignores dot directories.
+# shellcheck disable=SC2016 # expanded by sh in the container
+SKILLS_INSTALL='set -e
+d=$1
+shift
+mkdir -p "$d"
+t=$(mktemp -d "$d/.lettucectl.XXXXXX")
+trap '\''rm -rf "$t"'\'' EXIT
+tar -C "$t" --no-same-owner -xf -
+if [ -f "$d/.lettucectl-skills" ]; then
+  while read -r s; do [ -n "$s" ] && rm -rf "${d:?}/$s"; done <"$d/.lettucectl-skills"
+fi
+for s in "$@"; do
+  rm -rf "${d:?}/$s"
+  mv "$t/$s" "$d/$s"
+done
+printf "%s\n" "$@" >"$d/.lettucectl-skills"'
+
+# sync_skills NAME -> installs agent-skills/ into the stack's global skills, which
+# every agent of the stack loads; prints how many
+sync_skills() {
+  local src=$LETTUCE_HOME/agent-skills f s skills=()
+  for f in "$src"/*/SKILL.md; do
+    [[ -f $f ]] || continue
+    s=${f%/SKILL.md}
+    s=${s##*/}
+    [[ $s =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "invalid skill name '$s': lowercase letters, digits and '-'"
+    # The BFF rewrites its own skills on every connect, over any of ours.
+    [[ ! -e $(upstream_dir)/docker/agent-skills/$s ]] || die "skill '$s' is also shipped by upstream Lettuce; rename it"
+    skills+=("$s")
+  done
+  if ((${#skills[@]})); then
+    tar -C "$src" -cf - "${skills[@]}"
+  else
+    tar -cf - -T /dev/null
+  fi | compose "$1" exec -T app-server sh -c "$SKILLS_INSTALL" sh /root/.letta/skills "${skills[@]}" ||
+    die "$1: could not install skills (is the stack up?)"
+  printf '%s' "${#skills[@]}"
 }
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -195,7 +253,7 @@ cmd_add() {
     id=$(cf_tunnel_token "$acc" "$(env_get "$f" CF_TUNNEL_ID)") || die "$hint"
     env_set "$f" CLOUDFLARE_TUNNEL_TOKEN "$id"
   fi
-  cf_tunnel_configure "$acc" "$(env_get "$f" CF_TUNNEL_ID)" "$host" || die "$hint"
+  cf_tunnel_configure "$acc" "$(env_get "$f" CF_TUNNEL_ID)" "$host" "$(env_get "$f" COMPOSE_PROFILES)" || die "$hint"
   id=$(cf_dns_cname_create "$(cfg CF_ZONE_ID)" "$host" "$(env_get "$f" CF_TUNNEL_ID)" "lettucectl stack $name") || die "$hint"
   env_set "$f" CF_DNS_RECORD_ID "$id"
 
@@ -236,6 +294,9 @@ cmd_remove() {
   zone=$(cfg CF_ZONE_ID)
 
   info "This stops '$name' and deletes its DNS record, tunnel and Access application."
+  if has_profile "$(env_get "$f" COMPOSE_PROFILES)" secrets; then
+    info "Its vault (the people's saved personal data) is deleted too: its volume goes with the stack."
+  fi
   if [[ -n $purge ]]; then
     info "--purge also deletes ALL of its data (agents, memory, conversations): $(stack_dir "$name")"
   else
@@ -303,7 +364,7 @@ cmd_remove() {
 cmd_profiles() {
   (($# <= 1)) || die "usage: lettucectl profiles [<profile>,<profile>...]"
   local new n changed="" stale
-  local -a stacks gone failed=()
+  local -a stacks gone failed=() unrouted=()
   mapfile -t stacks < <(list_stacks)
   if (($# == 0)); then
     require_config
@@ -332,6 +393,15 @@ cmd_profiles() {
     done
     env_set "$(config_file)" PROFILES "$new"
     info "profiles for every stack: $new"
+  fi
+
+  # The tunnel routes /secrets/ only with the `secrets` profile. Applied on
+  # every run, before the stacks start, so a re-run repairs a failed update.
+  for n in "${stacks[@]}"; do
+    route_stack "$n" || unrouted+=("$n")
+  done
+
+  if [[ -n $changed ]]; then
     for n in "${stacks[@]}"; do
       cmd_up "$n"
     done
@@ -355,7 +425,9 @@ cmd_profiles() {
       google_reminder "$n"
     done
   fi
-  ((${#failed[@]} == 0)) || die "could not remove the containers of dropped profiles in: ${failed[*]}; run the same command again"
+  ((${#unrouted[@]} == 0)) || warn "could not update the tunnel routes of: ${unrouted[*]}"
+  ((${#failed[@]} == 0)) || warn "could not remove the containers of dropped profiles in: ${failed[*]}"
+  ((${#unrouted[@]} + ${#failed[@]} == 0)) || die "run the same command again"
 }
 
 cmd_upgrade() {
@@ -442,11 +514,479 @@ cmd_compose() {
   compose "$@"
 }
 
+# find_agent NAME AGENT -> "<id>\t<name>" of the stack's agent whose id, or name
+# ignoring case, is AGENT; dies when none or several match
+find_agent() {
+  local list matches
+  # letta exits before flushing a pipe past 64 KiB, and each agent carries its
+  # whole system prompt, so the list goes through a file in the container.
+  # stdin stays for the shell: `compose exec` would forward it here.
+  # shellcheck disable=SC2016 # expanded by sh in the container
+  list=$(compose "$1" exec -T app-server sh -c \
+    'f=$(mktemp); letta agents list --limit 1000 >"$f"; rc=$?; cat "$f"; rm -f "$f"; exit $rc' </dev/null) ||
+    die "$1: could not list agents (is the stack up?)"
+  matches=$(jq -r --arg a "$2" \
+    '.items[] | select(.id == $a or (.name | ascii_downcase) == ($a | ascii_downcase)) | "\(.id)\t\(.name)"' \
+    <<<"$list") || die "$1: unexpected output from 'letta agents list'"
+  case $(grep -c . <<<"$matches") in
+    0) die "$1 has no agent '$2'; agents: $(jq -r '[.items[].name] | join(", ")' <<<"$list")" ;;
+    1) printf '%s' "$matches" ;;
+    *) die "$1 has several agents named '$2'; use an id: $(cut -f1 <<<"$matches" | paste -sd' ')" ;;
+  esac
+}
+
+# open_agent NAME AGENT -> sets the caller's id, ws (the workspace on the host)
+# and agent_env (what letta-code sets for the agent's Bash tool, as -e options);
+# dies when the agent or its workspace does not exist
+open_agent() {
+  local agent agent_name
+  agent=$(find_agent "$1" "$2")
+  id=${agent%%$'\t'*}
+  agent_name=${agent#*$'\t'}
+  ws=$(env_get "$(stack_env "$1")" LETTA_STATE_DIR)/workspaces/$id
+  [[ -d $ws ]] || die "$1: no workspace for $agent_name at $ws"
+  agent_env=(-e "AGENT_ID=$id" -e "LETTA_AGENT_ID=$id" -e "AGENT_NAME=$agent_name" -e "USER_CWD=/work/$id")
+  info "$1: $agent_name ($id)"
+}
+
+# Close to, not the same as, an agent's Bash tool: letta-code also sets the
+# conversation id, per-agent secrets and a few PATH entries.
+cmd_shell() {
+  (($# == 1 || $# == 2)) || die "usage: lettucectl shell <name> [agent]"
+  validate_name "$1"
+  require_stack "$1"
+  local tty=() id ws agent_env=()
+  [[ -t 0 && -t 1 ]] || tty=(-T)
+  if (($# == 1)); then
+    compose "$1" exec "${tty[@]}" -w /work app-server bash
+    return
+  fi
+  open_agent "$1" "$2"
+  # The memory path is letta-code's local-backend layout (getLocalBackendMemoryFilesystemRoot).
+  # shellcheck disable=SC2016 # expanded by bash in the container
+  compose "$1" exec "${tty[@]}" -w "/work/$id" "${agent_env[@]}" \
+    app-server bash -c 'export MEMORY_DIR=$LETTA_LOCAL_BACKEND_DIR/memfs/$AGENT_ID/memory
+export LETTA_MEMORY_DIR=$MEMORY_DIR
+exec bash'
+}
+
+# ── toolbox ──────────────────────────────────────────────────────────────────
+# `toolbox` works on an agent's workspace with the operator's own tools from a
+# throwaway container. Agents run in the app-server, so unlike `shell` nothing it
+# brings in is visible to them. The helpers below add to cmd_toolbox's arrays.
+
+toolbox_file() { printf '%s/lettucectl/toolbox' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+# tilde PATH HOME -> PATH with a leading ~ replaced by HOME
+tilde() {
+  # shellcheck disable=SC2088 # matching a literal ~ from the toolbox file
+  case $1 in
+    "~") printf '%s' "$2" ;;
+    "~/"*) printf '%s/%s' "$2" "${1#"~/"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# toolbox_mount SRC DEST ro|rw
+toolbox_mount() {
+  [[ -e $1 ]] || die "toolbox: $1 does not exist"
+  [[ $1 == /* && $2 == /* ]] || die "toolbox: mount paths must be absolute: $1 $2"
+  [[ $1$2 != *:* ]] || die "toolbox: mount paths cannot contain ':': $1 $2"
+  run+=(-v "$1:$2:$3")
+}
+
+# toolbox_secret NAME VALUE -> passed to the container by name, never in argv; a
+# later value for the same NAME replaces the earlier one
+toolbox_secret() {
+  local i
+  for i in "${!secret_names[@]}"; do
+    if [[ ${secret_names[i]} == "$1" ]]; then
+      secret_values[i]=$2
+      return
+    fi
+  done
+  secret_names+=("$1")
+  secret_values+=("$2")
+}
+
+# toolbox_builtins -> what every operator gets, each only when the host has it
+toolbox_builtins() {
+  local claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude} f tok found=""
+  if [[ -n ${SSH_AUTH_SOCK:-} && -e $SSH_AUTH_SOCK ]]; then
+    run+=(-v "$SSH_AUTH_SOCK:/run/ssh-agent.sock" -e SSH_AUTH_SOCK=/run/ssh-agent.sock)
+    have+=(ssh-agent)
+  fi
+  if [[ -f $HOME/.ssh/known_hosts ]]; then
+    toolbox_mount "$HOME/.ssh/known_hosts" /root/.ssh/known_hosts ro
+  fi
+  if [[ -f $HOME/.gitconfig ]]; then
+    toolbox_mount "$HOME/.gitconfig" /root/.gitconfig ro
+    have+=(git)
+  fi
+  if command -v gh >/dev/null && tok=$(gh auth token 2>/dev/null </dev/null) && [[ -n $tok ]]; then
+    # The host's credential helper may call gh by a path the image does not have.
+    run+=(-e GIT_CONFIG_COUNT=2
+      -e GIT_CONFIG_KEY_0=credential.https://github.com.helper -e GIT_CONFIG_VALUE_0=
+      -e GIT_CONFIG_KEY_1=credential.https://github.com.helper -e "GIT_CONFIG_VALUE_1=!gh auth git-credential")
+    toolbox_secret GH_TOKEN "$tok"
+    have+=(gh)
+  fi
+  for f in CLAUDE.md settings.json skills agents commands; do
+    if [[ -e $claude/$f ]]; then
+      toolbox_mount "$claude/$f" "/root/.claude/$f" ro
+      found=1
+    fi
+  done
+  [[ -z $found ]] || have+=("claude config")
+  tok=${CLAUDE_CODE_OAUTH_TOKEN:-}
+  if [[ -z $tok ]] && command -v secret-tool >/dev/null; then
+    tok=$(secret-tool lookup service claude-toolbox 2>/dev/null </dev/null) || tok=""
+  fi
+  if [[ -n $tok ]]; then
+    toolbox_secret CLAUDE_CODE_OAUTH_TOKEN "$tok"
+    have+=("claude token")
+  fi
+}
+
+# toolbox_personal FILE -> the operator's own additions; parsed, never sourced.
+# One per line, words split on spaces:
+#   mount SRC [DEST] [rw]       read-only unless rw; DEST defaults to SRC
+#   secret NAME COMMAND [ARG]   NAME is set to the command's output, by name only
+#   env NAME=VALUE              a plain variable
+# ~ is the operator's home in SRC and commands, and /root in DEST.
+toolbox_personal() {
+  local file=$1 line w a n=0 src dest mode val name
+  [[ -f $file ]] || return 0
+  [[ -O $file ]] || die "$file is not owned by you"
+  ((((8#$(file_mode "$file")) & 8#022) == 0)) || die "$file is writable by others (chmod 600 $file)"
+  while IFS= read -r line || [[ -n $line ]]; do
+    read -ra w <<<"$line"
+    [[ ${#w[@]} == 0 || ${w[0]} == \#* ]] && continue
+    case ${w[0]} in
+      mount)
+        a=("${w[@]:1}")
+        mode=ro
+        if ((${#a[@]} > 1)) && [[ ${a[-1]} == rw ]]; then
+          mode=rw
+          unset 'a[-1]'
+        fi
+        ((${#a[@]} == 1 || ${#a[@]} == 2)) || die "$file: expected 'mount SRC [DEST] [rw]': $line"
+        src=$(tilde "${a[0]}" "$HOME")
+        dest=$src
+        [[ -z ${a[1]:-} ]] || dest=$(tilde "${a[1]}" /root)
+        toolbox_mount "$src" "$dest" "$mode"
+        ;;
+      secret)
+        name=${w[1]:-}
+        ((${#w[@]} >= 3)) && [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+          die "$file: expected 'secret NAME COMMAND [ARG...]': $line"
+        a=()
+        for val in "${w[@]:2}"; do a+=("$(tilde "$val" "$HOME")"); done
+        val=$("${a[@]}" </dev/null) || die "$file: secret $name: '${a[*]}' failed"
+        [[ -n $val ]] || die "$file: secret $name: '${a[*]}' printed nothing"
+        toolbox_secret "$name" "$val"
+        ;;
+      env)
+        ((${#w[@]} == 2)) && [[ ${w[1]} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] ||
+          die "$file: expected 'env NAME=VALUE': $line"
+        run+=(-e "${w[1]}")
+        ;;
+      *) die "$file: unknown directive '${w[0]}': $line" ;;
+    esac
+    n=$((n + 1))
+  done <"$file"
+  ((n == 0)) || have+=("+$n from $file")
+}
+
+cmd_toolbox() {
+  (($# >= 2)) || die "usage: lettucectl toolbox <name> <agent> [command...]"
+  validate_name "$1"
+  require_stack "$1"
+  local name=$1 id ws image config path label i run=() agent_env=() secret_names=() secret_values=() have=() argv=("${@:3}")
+  open_agent "$name" "$2"
+  image=$(compose "$name" config --format json | jq -r '.services["app-server"].image // empty') ||
+    die "$name: docker compose config failed"
+  [[ -n $image ]] || die "$name: the compose config has no app-server image"
+  config=$(host_docker image inspect --format '{{json .Config}}' "$image") ||
+    die "$name: no image $image; run: lettucectl up $name"
+  path=$(jq -r '.Env // [] | map(select(startswith("PATH="))) | .[0] // "" | ltrimstr("PATH=")' <<<"$config")
+  [[ -n $path ]] || die "$name: image $image sets no PATH"
+
+  run=(run --rm --init -i)
+  if [[ -t 0 && -t 1 ]]; then run+=(-t); fi
+  # Compose labelled the image it built, and a container inherits those labels, so
+  # Compose and `stale_services` would take the toolbox for one of the stack's
+  # app-server containers. Emptied, they no longer match the project filters.
+  for label in $(jq -r '.Labels // {} | keys[] | select(startswith("com.docker.compose."))' <<<"$config"); do
+    run+=(--label "$label=")
+  done
+  # shellcheck disable=SC2054 # the commas are tmpfs options
+  run+=(--hostname "toolbox-$name" --label "lettucectl.toolbox=$name" --label "lettucectl.agent=$id"
+    --security-opt no-new-privileges --memory 8g --pids-limit 4096
+    --tmpfs /root:mode=700,exec --tmpfs /tmp:exec
+    -v "$ws:/work/$id" -w "/work/$id" "${agent_env[@]}"
+    -e "PATH=/opt/claude-code/bin:$path")
+  toolbox_builtins
+  toolbox_personal "$(toolbox_file)"
+  for i in "${!secret_names[@]}"; do run+=(-e "${secret_names[i]}"); done
+
+  if ((${#have[@]})); then
+    info "toolbox: $(printf '%s, ' "${have[@]}" | sed 's/, $//')"
+  else
+    info "toolbox: nothing of yours found"
+  fi
+  [[ " ${secret_names[*]} " == *" CLAUDE_CODE_OAUTH_TOKEN "* ]] ||
+    warn "no Claude token, so claude will ask you to log in; to set one up once: claude setup-token, then: secret-tool store --label='Claude toolbox' service claude-toolbox"
+  # Secrets reach docker through its environment, so they never show in argv
+  # (which `env -i NAME=value` would do); `-e NAME` copies each one.
+  (
+    for i in "${!secret_names[@]}"; do export "${secret_names[i]}=${secret_values[i]}"; done
+    exec docker "${run[@]}" "$image" "${argv[@]:-bash}"
+  )
+}
+
+# ── backup ───────────────────────────────────────────────────────────────────
+# `backup` copies what the images cannot recreate (agents, memory, conversations,
+# workspaces, agent-installed tools, Settings skills, the vault and stack.env) to
+# <dir>/<name>/: a dated rsync snapshot that hard-links files unchanged since the
+# previous one, or with --compress a tar.gz. The state is root-owned, so it is
+# read in a throwaway container of backup/Dockerfile. The helpers below read
+# cmd_backup's settings (dest, compress, tools, when, keep).
+
+BACKUP_IMAGE=lettuce-backup:local
+# No network, and only the capabilities copying needs: read everything, write
+# into the operator's directory and hand the copies to the operator (--chown).
+# --init: as PID 1, sh would ignore the signal docker forwards on Ctrl-C.
+BACKUP_RUN=(run --rm --init --network none --read-only --tmpfs /tmp --security-opt no-new-privileges
+  --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER)
+# A backup's name: its UTC start time, which sorts by age.
+BACKUP_TS='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+
+# Run by sh in the backup container as: sh -c "$BACKUP_COPY" sh MODE SRC DST OWNER
+# PREV OUT EXCLUDE... MODE rsync copies SRC to DST/OUT owned by OWNER, hard-linking
+# files unchanged since DST/PREV; MODE tar writes a tar.gz of SRC to stdout, with
+# the real owners a restore needs. EXCLUDEs are relative to SRC. The skills
+# lettucectl installed are left out too (`skills` reinstalls them); their manifest
+# is read here because the host may not be allowed to.
+# shellcheck disable=SC2016 # expanded by sh in the container
+BACKUP_COPY='set -e
+mode=$1 src=$2 dst=$3 owner=$4 prev=$5 out=$6
+shift 6
+x=$(mktemp)
+for p in "$@"; do printf "%s\n" "$p"; done >"$x"
+m=$src/state/letta-home/skills/.lettucectl-skills
+if [ -f "$m" ]; then
+  echo state/letta-home/skills/.lettucectl-skills >>"$x"
+  while read -r s; do
+    if [ -n "$s" ]; then echo "state/letta-home/skills/$s" >>"$x"; fi
+  done <"$m"
+fi
+rc=0
+if [ "$mode" = tar ]; then
+  sed "s|^|./|" "$x" >"$x.tar"
+  tar -C "$src" --numeric-owner --anchored -X "$x.tar" -czf - . || rc=$?
+  # 1: a file changed while it was read, as in a live copy; the archive is complete.
+  if [ "$rc" = 1 ]; then echo "warning: files changed during the copy" >&2; rc=0; fi
+else
+  sed "s|^|/|" "$x" >"$x.rsync"
+  rsync -aH --numeric-ids --chown="$owner" --exclude-from="$x.rsync" \
+    ${prev:+--link-dest="$dst/$prev"} "$src/" "$dst/$out/" || rc=$?
+  # 24: files vanished while copying, as in a live copy.
+  if [ "$rc" = 24 ]; then echo "warning: files vanished during the copy" >&2; rc=0; fi
+fi
+exit "$rc"'
+
+# backup_list DIR SUFFIX -> DIR's snapshots (SUFFIX "") or archives (SUFFIX
+# .tar.gz), oldest first
+backup_list() {
+  local p
+  # shellcheck disable=SC2086 # BACKUP_TS is a glob
+  for p in "$1"/$BACKUP_TS"$2"; do
+    if [[ -e $p ]]; then printf '%s\n' "${p##*/}"; fi
+  done
+}
+
+# backup_rm NAME DIR ENTRY... -> deletes DIR's entries from the container: a
+# snapshot can hold read-only directories (Go's module cache) the operator cannot empty
+backup_rm() {
+  local name=$1 dir=$2 e paths=()
+  shift 2
+  (($#)) || return 0
+  for e in "$@"; do paths+=("/dst/$e"); done
+  host_docker "${BACKUP_RUN[@]}" --label "lettucectl.backup=$name" -v "$dir:/dst" "$BACKUP_IMAGE" \
+    rm -rf -- "${paths[@]}" || die "$name: could not delete $* in $dir"
+}
+
+# backup_choice NAME -> pause|live for a running stack: --pause or --live, else the
+# operator's answer
+backup_choice() {
+  local answer=""
+  if [[ -n $when ]]; then
+    printf '%s' "$when"
+    return
+  fi
+  info "$1 is running. A live copy can catch memory repos, conversations or the vault mid-write and"
+  info "leave a corrupt backup; pausing is recommended (agents and the UI freeze until the copy ends)."
+  info "  [p] pause $1 while copying   [l] copy live anyway (not recommended)   [a] abort"
+  printf 'Choice [p/l/a]: ' >&2
+  read -r answer || true
+  case $answer in
+    p | P) printf pause ;;
+    l | L) printf live ;;
+    *) die "aborted (to answer ahead of time, as from cron: --pause or --live)" ;;
+  esac
+}
+
+# backup_prune NAME DIR -> keeps DIR's newest $keep backups of the kind just made
+backup_prune() {
+  local name=$1 dir=$2 p old=()
+  if [[ -n $compress ]]; then
+    mapfile -t old < <(backup_list "$dir" .tar.gz | head -n -"$keep")
+    for p in "${old[@]}"; do rm -f -- "${dir:?}/$p"; done
+  else
+    mapfile -t old < <(backup_list "$dir" "" | head -n -"$keep")
+    backup_rm "$name" "$dir" "${old[@]}"
+  fi
+  ((${#old[@]} == 0)) || info "$name: removed ${#old[@]} older backup(s): ${old[*]}"
+}
+
+# backup_stack NAME -> one backup of the stack into $dest/NAME. Run in a subshell:
+# the lock it takes is released when that exits.
+backup_stack() {
+  local name=$1 f state dir ts prev s p lock vol choice="" mounts=() excludes=() stale=()
+  f=$(stack_env "$name")
+  state=$(env_get "$f" LETTA_STATE_DIR)
+  [[ -d $state ]] || die "$name: no state directory at $state"
+  dir=$dest/$name
+  (umask 077 && mkdir -p "$dir")
+  # A second run would take this one's .partial-* for a leftover and delete it.
+  exec {lock}>"$dir/.lock"
+  flock -n "$lock" || die "$name: another backup of $name is running"
+  mounts=(--label "lettucectl.backup=$name" -v "$state:/src/state:ro" -v "$f:/src/stack.env:ro")
+  # Turning the secrets profile off keeps the volume, so look for it either way;
+  # `run -v` would create a missing one.
+  vol=lettuce-${name}_secret-broker-data
+  if host_docker volume inspect "$vol" >/dev/null 2>&1; then
+    mounts+=(-v "$vol:/src/vault:ro")
+  elif has_profile "$(env_get "$f" COMPOSE_PROFILES)" secrets; then
+    warn "$name: the vault volume $vol does not exist yet; backing up without it"
+  fi
+  excludes=(state/letta-home/mod-cache state/letta-home/claude/paste-cache state/letta-home/claude/backups)
+  # The BFF rewrites upstream's skills on every connect.
+  for s in "$(upstream_dir)"/docker/agent-skills/*/; do
+    if [[ -d $s ]]; then
+      s=${s%/}
+      excludes+=("state/letta-home/skills/${s##*/}")
+    fi
+  done
+  [[ -n $tools ]] || excludes+=(state/tools)
+
+  # What an interrupted run left behind.
+  for p in "$dir"/.partial-*; do
+    if [[ -e $p ]]; then stale+=("${p##*/}"); fi
+  done
+  backup_rm "$name" "$dir" "${stale[@]}"
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  [[ ! -e $dir/$ts && ! -e $dir/$ts.tar.gz ]] || die "$name: $dir/$ts already exists; run again in a second"
+  if stack_running "$name"; then
+    choice=$(backup_choice "$name")
+  fi
+  (
+    if [[ $choice == pause ]]; then
+      info "$name: paused while copying"
+      # Set first: a pause that fails partway leaves some containers paused.
+      trap 'compose "$name" unpause >/dev/null || warn "$name: could not unpause it; run: lettucectl compose $name unpause"' EXIT
+      trap 'exit 130' INT TERM
+      compose "$name" pause >/dev/null || die "$name: could not pause the stack"
+    fi
+    if [[ -n $compress ]]; then
+      if ! (umask 077 && host_docker "${BACKUP_RUN[@]}" "${mounts[@]}" "$BACKUP_IMAGE" \
+        sh -c "$BACKUP_COPY" sh tar /src "" "" "" "" "${excludes[@]}" >"$dir/.partial-$ts.tar.gz"); then
+        rm -f "$dir/.partial-$ts.tar.gz"
+        die "$name: the copy failed"
+      fi
+      mv "$dir/.partial-$ts.tar.gz" "$dir/$ts.tar.gz"
+    else
+      prev=$(backup_list "$dir" "" | tail -n 1)
+      host_docker "${BACKUP_RUN[@]}" "${mounts[@]}" -v "$dir:/dst" "$BACKUP_IMAGE" \
+        sh -c "$BACKUP_COPY" sh rsync /src /dst "$(id -u):$(id -g)" "$prev" ".partial-$ts" "${excludes[@]}" ||
+        die "$name: the copy failed; the next run removes $dir/.partial-$ts"
+      mv "$dir/.partial-$ts" "$dir/$ts"
+    fi
+  )
+  info "$name: $dir/$ts${compress:+.tar.gz}"
+  [[ -z $keep ]] || backup_prune "$name" "$dir"
+}
+
+cmd_backup() {
+  local usage="usage: lettucectl backup <name|all> <dir> [--compress] [--no-tools] [--pause|--live] [--keep N]"
+  local dest compress="" tools=1 when="" keep="" n rc targets args=() failed=()
+  while (($#)); do
+    case $1 in
+      --compress) compress=1 ;;
+      --no-tools) tools="" ;;
+      --pause | --live)
+        [[ -z $when || $when == "${1#--}" ]] || die "use --pause or --live, not both"
+        when=${1#--}
+        ;;
+      --keep)
+        [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "--keep needs how many backups to keep, 1 or more"
+        keep=$2
+        shift
+        ;;
+      -*) die "$usage" ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#args[@]} == 2)) || die "$usage"
+  require_initialised
+  targets=$(expand_targets "${args[0]}")
+  dest=${args[1]}
+  [[ $dest != *[:,]* ]] || die "the destination cannot contain ':' or ','; backup writes to a local directory"
+  [[ -d $dest ]] || die "$dest is not a directory"
+  dest=$(realpath "$dest")
+  [[ $dest != *[:,]* ]] || die "the destination cannot contain ':' or ',': $dest"
+  # This repo is public, and a backup holds stack.env and the agents' logins.
+  [[ $dest/ != "$LETTUCE_HOME"/* ]] || die "the destination cannot be inside $LETTUCE_HOME"
+  command -v flock >/dev/null || die "flock is required but not installed (util-linux)"
+  host_docker build -q -t "$BACKUP_IMAGE" "$LETTUCE_HOME/backup" >/dev/null ||
+    die "could not build $BACKUP_IMAGE (backup/Dockerfile)"
+  # One stack failing must not cost the others their backup, but Ctrl-C stops
+  # them all (the trap runs once the stack's subshell is done). errexit is off
+  # inside a subshell that is part of `||` or `if`, so the status is read after.
+  trap 'exit 130' INT TERM
+  for n in $targets; do
+    set +e
+    (
+      set -e
+      backup_stack "$n"
+    )
+    rc=$?
+    set -e
+    ((rc == 0)) || failed+=("$n")
+  done
+  if ((${#failed[@]})); then
+    [[ ${args[0]} != all ]] || die "backup failed for: ${failed[*]}"
+    exit 1
+  fi
+}
+
+cmd_skills() {
+  (($# == 1)) || die "usage: lettucectl skills <name|all>"
+  local n targets k
+  targets=$(expand_targets "$1")
+  for n in $targets; do
+    k=$(sync_skills "$n")
+    info "$n: $k skill(s) installed"
+  done
+}
+
 main() {
   local cmd=${1:-help}
   shift || true
   case $cmd in
-    init | add | users | remove | profiles | upgrade | up | down | restart | check | status | list | logs | compose)
+    init | add | users | remove | profiles | upgrade | up | down | restart | check | status | list | logs | compose | shell | toolbox | skills | backup)
       "cmd_$cmd" "$@"
       ;;
     help | -h | --help) usage ;;

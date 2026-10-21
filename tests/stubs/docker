@@ -10,12 +10,55 @@ printf 'docker %s\n' "$*" >>"$STUB_LOG"
 printf 'docker-env PUBLIC_ORIGIN=%s\n' "${PUBLIC_ORIGIN:-}" >>"$STUB_LOG"
 args=" $* "
 case $args in
+  " run "*)
+    # Values passed by name (`-e NAME`) go to run-env.log, so tests can tell them
+    # from argv, which is all calls.log sees.
+    prev="" dst="" out=""
+    for a in "$@"; do
+      [[ $prev == -e && $a != *=* ]] && printf '%s=%s\n' "$a" "${!a-}" >>"$STUB_ROOT/run-env.log"
+      [[ $prev == -c ]] && printf '%s' "$a" >"$STUB_ROOT/run-script"
+      [[ $prev == -v && $a == *:/dst ]] && dst=${a%:/dst}
+      [[ $a == .partial-* ]] && out=$a
+      prev=$a
+    done
+    [[ ${STUB_RUN_RC:-0} == 0 ]] || exit "$STUB_RUN_RC"
+    # Like the backup copy: a snapshot appears in the destination.
+    [[ -n $dst && -n $out ]] && mkdir -p "$dst/$out"
+    exit 0
+    ;;
+  " volume inspect "*) exit "${STUB_VOLUME_RC:-0}" ;;
+  *" pause ") exit "${STUB_PAUSE_RC:-0}" ;;
+  *" ps --status running --services "*)
+    # Every container in $STUB_ROOT/containers.txt counts as running.
+    project=${args#* -p }
+    project=${project%% *}
+    awk -v p="$project" '$1 == p { print $2 }' "$STUB_ROOT/containers.txt" 2>/dev/null
+    ;;
+  " image inspect "*)
+    [[ ${STUB_IMAGE_RC:-0} == 0 ]] || exit "$STUB_IMAGE_RC"
+    # Like a Compose-built image: it carries the project's labels.
+    echo '{"Env":["NODE_VERSION=22","PATH=/usr/local/bin:/usr/bin:/bin"],"Labels":{"com.docker.compose.project":"lettuce-alfred","com.docker.compose.service":"app-server","org.opencontainers.image.title":"letta-code"}}'
+    ;;
   *" compose version "*) echo "${STUB_COMPOSE_VERSION:-2.40.3}" ;;
   *" ps -a --filter label=com.docker.compose.project="*)
     # Containers come from $STUB_ROOT/containers.txt, lines of "<project> <service>".
     project=${args#* label=com.docker.compose.project=}
     project=${project%% *}
     awk -v p="$project" '$1 == p { print $2 }' "$STUB_ROOT/containers.txt" 2>/dev/null
+    ;;
+  *" letta agents list "*)
+    cat >/dev/null # like `compose exec`, which forwards the caller's stdin
+    cat "$STUB_ROOT/agents.json" 2>/dev/null
+    exit "${STUB_AGENTS_RC:-0}"
+    ;;
+  *" exec "*)
+    cat >>"$STUB_ROOT/exec-stdin.log"
+    prev=""
+    for a in "$@"; do
+      [[ $prev == -c ]] && printf '%s' "$a" >"$STUB_ROOT/exec-script"
+      prev=$a
+    done
+    exit "${STUB_EXEC_RC:-0}"
     ;;
   *" config --format json "*) cat "$STUB_ROOT/compose-config.json" 2>/dev/null ;;
   *" config --services "*)
@@ -33,6 +76,7 @@ case $args in
         google) echo google-mcp ;;
         telegram) echo channel-gateway ;;
         cloudflared) echo cloudflared ;;
+        secrets) echo secret-broker ;;
       esac
     done
     ;;

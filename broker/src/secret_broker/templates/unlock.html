@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Unlock{% endblock %}
+{% block content %}
+<h1>Your vault is locked</h1>
+<p>Enter your passphrase to open it. It locks again when the server restarts, after 12 hours without use, or when you press Lock.</p>
+{% if problem %}<p class="card warn">{{ problem }}</p>{% endif %}
+<form method="post" action="/secrets/unlock" class="card" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Passphrase
+    <input type="password" name="passphrase" required autofocus autocomplete="current-password">
+  </label>
+  <button>Unlock</button>
+</form>
+<p class="muted">Forgot it? It cannot be recovered. You can erase the vault from Settings after unlocking, or ask whoever runs the server to remove its data.</p>
+{% endblock %}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test stub for `gh auth token`: prints STUB_GH_TOKEN (in stub.env), or fails like
+# a gh that is not logged in. Tests copy the stubs to $STUB_ROOT/bin.
+STUB_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=/dev/null
+[[ -f $STUB_ROOT/stub.env ]] && . "$STUB_ROOT/stub.env"
+[[ $* == "auth token" && -n ${STUB_GH_TOKEN:-} ]] || exit 1
+printf '%s\n' "$STUB_GH_TOKEN"

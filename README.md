@@ -56,7 +56,7 @@ Nobody can reach another person's stack. **Cloudflare authenticates the people; 
    ```
 3. Each person opens their URL, signs in with Google, and connects a model provider in Lettuce under **Settings -> Providers & models**. One API key per person keeps spending separate.
 
-Day-to-day commands, optional features, upgrades, backups and troubleshooting are in **[docs/operations.md](docs/operations.md)**. To give agents Gmail, Calendar, Tasks and Contacts, see **[docs/google-setup.md](docs/google-setup.md)**.
+Day-to-day commands, optional features, upgrades, backups and troubleshooting are in **[docs/operations.md](docs/operations.md)**. To give agents Gmail, Calendar, Tasks and Contacts, see **[docs/google-setup.md](docs/google-setup.md)**. To give each person an encrypted vault for their address, cards, documents and logins, which agents may use only when that person agrees, see **[docs/secret-broker.md](docs/secret-broker.md)**.
 
 ## What lives where
 | Path | Tracked | What |
@@ -64,9 +64,10 @@ Day-to-day commands, optional features, upgrades, backups and troubleshooting ar
 | `lettucectl`, `lib/` | yes | the CLI |
 | `compose/hardening.yml` | yes | `no-new-privileges`, memory/pid caps for every service, letta-code self-update off |
 | `compose/multi.yml` | yes | drops all published ports, so stacks never collide |
+| `compose/secrets.yml`, `broker/` | yes | the optional vault (`secrets` profile) and its source |
 | `config.env.example` | yes | template for `config.env` |
 | `scripts/dns-preflight.sh` | yes | compares two nameservers before and after moving a domain |
-| `tests/` | yes | offline tests (`tests/run.sh`); docker, curl and dig are stubbed |
+| `tests/` | yes | offline tests (`tests/run.sh`; docker, curl and dig are stubbed) and the broker's tests (`tests/run-broker.sh`) |
 | `config.env` | **no** | your settings plus cached Cloudflare ids (mode 600) |
 | `.secrets/cloudflare-api-token` | **no** | Cloudflare API token (mode 600) |
 | `upstream/` | **no** | Lettuce, cloned at `LETTUCE_REF` |
@@ -77,6 +78,7 @@ The compose files of each stack are applied in this order:
 1. `upstream/docker/compose.yml`
 2. `compose/hardening.yml`
 3. `compose/multi.yml`
+4. `compose/secrets.yml` (adds nothing unless the `secrets` profile is on)
 
 Each stack runs as Compose project `lettuce-<name>` with `--env-file stacks/<name>/stack.env`.
 
